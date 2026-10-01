@@ -17,7 +17,7 @@ venv/
 # them live in results/stage-B.md; the images themselves do not belong in git.
 results/suspects/
 
-# local process notes — not part of the public artifact
+# local process notes, not part of the public artifact
 CLAUDE.md
 ORCHESTRATION.md
 ROADMAP.md

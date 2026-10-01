@@ -1,22 +1,10 @@
-"""Does the language label describe the trajectory it is attached to?
+"""Cross-view diagnostics: does the language label match the trajectory?
 
-This is the vector-database half. Build one index over episodes with three
-aligned views -- what the camera saw, what the arm did, and what the label says
--- and every question below becomes a nearest-neighbour query.
-
-The core idea is neighbourhood disagreement, and it needs no ground truth. If an
-episode's visually-nearest neighbours all carry the label "open the drawer" and
-this one says "pick up the mug", exactly one of two things is true: the label is
-wrong, or the episode is genuinely unusual. Both are worth surfacing, and the
-ranking is cheap. This is the confident-learning idea -- infer label errors from
-the structure of the data rather than from a clean reference set -- transplanted
-to a setting where the labels are free text and the features are trajectories.
-
-The second question is blunter and, if the answer is bad, more important:
-*across the corpus as a whole, do the vision and language spaces line up at
-all?* If visual neighbours are not language neighbours, then the instructions
-carry essentially no information about behaviour, and no amount of architecture
-work will make a policy follow them.
+Each episode has several embedding views (camera, action, instruction). The
+main tool is neighbourhood disagreement: if an episode's visual neighbours
+carry one label and it carries another, either the label is wrong or the
+episode is unusual. No ground truth is needed. The other functions measure
+how well two views line up across the whole corpus.
 """
 
 from __future__ import annotations
@@ -73,10 +61,8 @@ def normalize(x: np.ndarray) -> np.ndarray:
 def knn_indices(embeddings: np.ndarray, k: int, *, exclude_self: bool = True) -> np.ndarray:
     """Exact k-nearest-neighbour indices by cosine similarity.
 
-    Exact, not approximate, and deliberately so. At the scale this project runs
-    at -- a few hundred thousand vectors -- brute force is minutes on a laptop,
-    and using it removes a whole class of "did my ANN recall cause that
-    result?" objections before anyone raises them.
+    Brute force is used on purpose. At a few hundred thousand vectors it is
+    cheap, and it rules out ANN recall as an explanation for any result.
     """
     x = normalize(embeddings)
     n = x.shape[0]
@@ -95,42 +81,31 @@ def neighborhood_disagreement(
     label_view: np.ndarray,
     k: int = 10,
 ) -> np.ndarray:
-    """Rank episodes by how much their label clashes with their neighbours'.
+    """Score each episode by how much its label differs from its neighbours'.
 
     Args:
-        query_view: ``[N, d1]`` the view used to decide who is a neighbour --
-            visual embeddings, action embeddings, or both concatenated.
-        label_view: ``[N, d2]`` the view being checked, i.e. the instruction
-            embedding.
+        query_view: ``[N, d1]`` view used to find neighbours (visual or action
+            embeddings).
+        label_view: ``[N, d2]`` view being checked (instruction embeddings).
         k: neighbourhood size.
 
     Returns:
-        ``[N]`` scores in ``[0, 2]``; higher means this episode's label is more
-        unlike the labels of behaviourally similar episodes.
-
-    A high score is a *suspect*, not a verdict. The two ways to earn one --
-    a wrong label, or a genuinely rare behaviour -- are separated by looking,
-    which is what makes the ranked list useful: it turns "audit 75,000
-    episodes" into "audit the worst 200."
+        ``[N]`` scores in ``[0, 2]``. Higher means the label is less like the
+        labels of similar episodes. A high score can also mean a rare but
+        correctly labelled behaviour, so it flags a suspect, not an error.
     """
     q = normalize(query_view)
     lab = normalize(label_view)
     if q.shape[0] != lab.shape[0]:
         raise ValueError("views must cover the same episodes")
     nn = knn_indices(q, k)
-    # Mean cosine similarity between each label and its behavioural neighbours'
-    # labels; 1 - that is the disagreement.
+    # 1 - mean cosine similarity between each label and its neighbours' labels
     sims = np.einsum("nd,nkd->nk", lab, lab[nn])
     return 1.0 - sims.mean(axis=1)
 
 
 def neighborhood_overlap(view_a: np.ndarray, view_b: np.ndarray, k: int = 10) -> np.ndarray:
-    """Per-episode Jaccard overlap between its neighbours in two views.
-
-    The single most diagnostic number in the whole audit. If an episode's
-    visual neighbours and its language neighbours are disjoint sets, the label
-    is not describing what the camera saw.
-    """
+    """Per-episode Jaccard overlap between its k nearest neighbours in two views."""
     na, nb = knn_indices(view_a, k), knn_indices(view_b, k)
     out = np.empty(na.shape[0])
     for i in range(na.shape[0]):
@@ -144,12 +119,9 @@ def rank_correlation_across_views(
 ) -> float:
     """Spearman correlation between pairwise distances in two views.
 
-    Complements :func:`neighborhood_overlap`: overlap only sees the top-k, this
-    sees the whole geometry. Near zero means the two spaces are unrelated at
-    every scale, not just locally.
-
-    Subsampled because the full pairwise set is quadratic; ``sample`` episodes
-    gives ``sample*(sample-1)/2`` pairs, which is ample.
+    Unlike :func:`neighborhood_overlap`, this looks at the whole geometry and
+    not only the top-k. It runs on a random subsample of ``sample`` episodes
+    because the full pairwise set is quadratic.
     """
     a, b = normalize(view_a), normalize(view_b)
     n = a.shape[0]
@@ -168,15 +140,9 @@ def cca_alignment(
 ) -> AlignmentResult:
     """Canonical correlations between two embedding views.
 
-    Asks the linear-algebraic version of the question: is there *any* linear
-    map under which vision and language line up? Canonical correlations near 1
-    mean a shared subspace exists; near 0 means there is nothing linear to find,
-    which is a much stronger negative result than a low neighbourhood overlap.
-
-    Implemented by whitening both views and taking the SVD of the cross-
-    covariance -- the standard construction. ``reg`` ridges the covariances,
-    which is not optional at embedding dimensionality, where sample covariance
-    matrices are near-singular.
+    Whitens both views and takes the SVD of the cross-covariance. ``reg``
+    ridges the covariances, which is needed because sample covariances are
+    near-singular at embedding dimensionality.
     """
     a = np.asarray(view_a, dtype=float)
     b = np.asarray(view_b, dtype=float)
@@ -207,10 +173,8 @@ def _sqrtm_psd(m: np.ndarray) -> np.ndarray:
 def gaussian_mi_from_cca(correlations: np.ndarray) -> float:
     """Mutual information in nats under a joint-Gaussian assumption.
 
-    ``I = -0.5 * sum(log(1 - rho_i^2))``. The Gaussian assumption is wrong for
-    embeddings, but it is wrong in a *known* direction and it is stable in high
-    dimension, which the k-NN estimators below are not. Use this as the headline
-    and KSG as a sanity check, never the reverse.
+    ``I = -0.5 * sum(log(1 - rho_i^2))``. The Gaussian assumption does not hold
+    for embeddings, but this estimate is stable in high dimension, unlike KSG.
     """
     r = np.clip(np.asarray(correlations, dtype=float), 0.0, 1 - 1e-9)
     return float(-0.5 * np.log1p(-(r**2)).sum())
@@ -219,13 +183,8 @@ def gaussian_mi_from_cca(correlations: np.ndarray) -> float:
 def mutual_information_ksg(x: np.ndarray, y: np.ndarray, k: int = 5) -> float:
     """Kraskov-Stoegbauer-Grassberger mutual information estimator (variant 1).
 
-    Nonparametric and assumption-free, which is the appeal -- and severely
-    biased above roughly ten dimensions, which is the catch. **Reduce both views
-    with PCA before calling this**, and treat a raw 384-dimensional KSG estimate
-    as meaningless rather than as evidence.
-
-    Returns MI in nats; clipped at zero, since negative estimates are pure
-    estimator noise.
+    The estimator is badly biased above roughly ten dimensions, so reduce both
+    views with PCA before calling it. Returns MI in nats, clipped at zero.
     """
     x = np.atleast_2d(np.asarray(x, dtype=float))
     y = np.atleast_2d(np.asarray(y, dtype=float))
@@ -246,12 +205,10 @@ def mutual_information_ksg(x: np.ndarray, y: np.ndarray, k: int = 5) -> float:
 
 
 def effective_rank(embeddings: np.ndarray) -> float:
-    """``exp`` of the entropy of the normalised spectrum.
+    """``exp`` of the entropy of the normalised singular-value spectrum.
 
-    Applied to the instruction embeddings, this says how many independent
-    directions the *language* actually spans. A corpus advertising 160,000
-    tasks whose instruction embeddings have an effective rank of 8 does not have
-    160,000 tasks; it has 8 templates and a lot of paraphrase.
+    For instruction embeddings this estimates how many independent directions
+    the language spans.
     """
     x = np.asarray(embeddings, dtype=float)
     s = np.linalg.svd(x - x.mean(0), compute_uv=False)
@@ -261,7 +218,7 @@ def effective_rank(embeddings: np.ndarray) -> float:
 
 
 def instruction_space_report(instruction_embeddings: np.ndarray, texts: list[str] | None = None) -> dict:
-    """Summary of how much variety the language side really contains."""
+    """Summary statistics for the variety in a set of instruction embeddings."""
     x = np.asarray(instruction_embeddings, dtype=float)
     xn = normalize(x)
     sim = xn @ xn.T

@@ -1,12 +1,8 @@
-"""Weekend one: how much do DROID's three annotators agree with each other?
+"""Inter-annotator agreement on DROID's language instructions.
 
-DROID paid crowdworkers to write natural-language instructions for its robot
-episodes, collecting up to three independent descriptions each. The dataset
-paper reports no inter-annotator agreement, no error rate, and no quality
-validation for language. This script computes the missing number.
-
-The annotations ship as a separate 12 MB JSON, so none of the 1.8 TB of video is
-needed. Structure:
+DROID collected up to three crowdsourced instructions per episode, and the
+dataset paper reports no agreement number for them. The annotations ship as a
+separate 12 MB JSON, so none of the video is needed. Structure:
 
     "IRIS+7dfa2da3+2023-04-25-11h-42m-28s": {
         "language_instruction1": "Pour the contents of the bottle on the right into the sink",
@@ -49,17 +45,14 @@ MODEL = "sentence-transformers/all-MiniLM-L6-v2"   # 384-d, ~80 MB, fast on MPS
 
 
 def fetch_annotations() -> dict:
-    """Download the annotation JSON once, then read from disk forever after."""
+    """Download the annotation JSON on first use and cache it under data/."""
     CACHE.mkdir(exist_ok=True)
     path = CACHE / "droid_annotations.json"
     if not path.exists():
         print(f"downloading annotations (~12 MB) from\n  {ANNOTATION_URL}")
         try:
-            # The python.org build on macOS ships no CA bundle of its own, so a
-            # plain urlretrieve dies with CERTIFICATE_VERIFY_FAILED unless the
-            # user has run "Install Certificates.command". certifi is already a
-            # transitive dependency (via requests/huggingface-hub), so trusting
-            # its bundle explicitly makes this work on a fresh checkout.
+            # The python.org build on macOS has no CA bundle, so urlopen fails with
+            # CERTIFICATE_VERIFY_FAILED. certifi is already a transitive dependency.
             import certifi
 
             ctx = ssl.create_default_context(cafile=certifi.where())
@@ -82,13 +75,9 @@ _WHITESPACE = re.compile(r"\s+")
 def normalize(text: str) -> str:
     """Collapse every run of whitespace to a single space, then strip.
 
-    The real annotation file is dirtier than the schema suggests: 794 strings
-    carry a trailing newline, 267 contain a double space, and one has a newline
-    in the middle of a sentence. `nominal` agreement compares strings exactly,
-    so without this two annotators who typed the *same* instruction but differed
-    by a stray space are scored as disagreeing -- 93 distinct strings across the
-    full file collapse once the whitespace is regularised. The embedding path is
-    largely insensitive to this, which is exactly why it would have gone unnoticed.
+    The annotation file has 794 strings with a trailing newline and 267 with a
+    double space. Nominal agreement compares strings exactly, so without this
+    identical instructions that differ by a stray space count as disagreement.
     """
     return _WHITESPACE.sub(" ", text).strip()
 
@@ -96,12 +85,8 @@ def normalize(text: str) -> str:
 def flatten(raw: dict, limit: int | None = None) -> tuple[np.ndarray, list[str], np.ndarray]:
     """One row per annotation. Returns (episode_ids, texts, annotator_slots).
 
-    Empty and whitespace-only instructions are dropped rather than embedded --
-    an empty string has no meaningful direction in embedding space, and
-    counting it as disagreement would inflate the result.
-
-    A slot may also be absent entirely: 12,500 of the 50,092 episodes carry only
-    `language_instruction1`, so `.get` (not `[...]`) is load-bearing here.
+    Empty instructions are dropped. A slot can also be missing: 12,500 of the
+    50,092 episodes carry only `language_instruction1`, hence `.get`.
     """
     episodes, texts, slots = [], [], []
     dropped_empty = 0
@@ -122,13 +107,10 @@ def flatten(raw: dict, limit: int | None = None) -> tuple[np.ndarray, list[str],
 
 
 def corpus_tag(texts: list[str]) -> str:
-    """Cache key that changes whenever the corpus does.
+    """Cache key built from the model name and a hash of every text.
 
-    Keying on `len(texts)` alone is not safe: a change to parsing that rewrites
-    text without adding or removing rows -- whitespace normalisation, say --
-    keeps the count identical and would silently reload embeddings of the *old*
-    strings. Hashing the content makes a stale cache impossible rather than
-    unlikely, and the model name is included so swapping encoders re-embeds too.
+    The row count alone is not enough: a parsing change such as whitespace
+    normalisation keeps the count but changes the strings.
     """
     h = hashlib.sha256(MODEL.encode())
     for t in texts:
@@ -210,10 +192,8 @@ def main() -> None:
     print("\n" + "=" * 66)
     print("BY LAB")
     print("=" * 66)
-    # Each lab gets its own episode-clustered bootstrap. The per-lab samples are
-    # one to two orders of magnitude smaller than the corpus, so their intervals
-    # are correspondingly wider -- reading a ranking off the point estimates
-    # alone would invent a lab-quality ordering the data does not support.
+    # Per-lab samples are much smaller than the corpus, so each lab gets its own
+    # episode-clustered bootstrap and its intervals are wider.
     labs = np.array([e.split("+")[0] for e in episodes])
     rows = []
     for lab in np.unique(labs):
@@ -239,13 +219,12 @@ def main() -> None:
 
     if len(rows) >= 2:
         worst, best = rows[0], rows[-1]
-        # Non-overlap of two marginal intervals is a conservative test of a
-        # difference, and this is the extreme pair out of len(rows) labs chosen
-        # after seeing the data -- so treat a bare non-overlap as suggestive.
+        # The extreme pair is picked after seeing the data, so non-overlapping
+        # intervals are only suggestive.
         verdict = (
-            "do not overlap -- the spread across labs is larger than sampling noise"
+            "do not overlap: the spread across labs is larger than sampling noise"
             if worst[3] < best[2]
-            else "overlap -- the ordering of labs is not resolved at this sample size"
+            else "overlap: the ordering of labs is not resolved at this sample size"
         )
         print(f"\n  extremes ({worst[0]} vs {best[0]}) {verdict}")
         print(f"  note: extreme pair selected post hoc from {len(rows)} labs; not a corrected test")

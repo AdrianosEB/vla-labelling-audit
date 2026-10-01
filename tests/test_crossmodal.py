@@ -100,8 +100,7 @@ def test_cca_finds_the_shared_subspace_and_not_a_phantom_one():
 def test_cca_is_invariant_to_invertible_linear_maps():
     """Canonical correlations depend on the subspace, not on the basis.
 
-    This is the property that makes CCA the right tool here: it cannot be
-    fooled by one encoder happening to scale its outputs differently.
+    So an encoder that scales its outputs differently gives the same result.
     """
     rng = np.random.default_rng(3)
     a, b = aligned_views(n=300, seed=3)
@@ -176,7 +175,7 @@ def test_zero_noise_changes_nothing_and_full_shuffle_changes_most():
 
 
 def test_swap_preserves_the_label_multiset():
-    """Swap must not create or destroy labels -- only relocate them."""
+    """Swap must not create or destroy labels, only relocate them."""
     rng = np.random.default_rng(8)
     labels = rng.integers(0, 10, size=400)
     res = inject_label_noise(labels, 0.5, mode="swap", seed=2)

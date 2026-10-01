@@ -1,27 +1,20 @@
 """Does the DROID agreement number survive a change of sentence encoder?
 
-Every semantic-alpha figure this project reports is conditional on one model:
-all-MiniLM-L6-v2 decides what "means the same thing". A reviewer's obvious
-objection is that the headline is a fact about MiniLM's geometry, not about the
-annotators. This script answers it by recomputing the full analysis under four
-independent encoders spanning size (384-d to 1024-d), training recipe, and
-vendor, plus a deliberately non-neural TF-IDF floor that knows nothing about
-meaning beyond shared vocabulary.
+The semantic alpha depends on which model decides what "means the same thing".
+This script recomputes the analysis under four neural encoders that differ in
+size (384-d to 1024-d), training recipe and vendor, plus a TF-IDF arm that
+only sees shared vocabulary.
 
-Two different robustness claims are checked, because they can fail separately:
+Two things are checked:
 
-* **Level**: does alpha itself move? Encoders squash cosine similarity into
-  different ranges, so some drift in the absolute number is expected and is not
-  by itself damning -- which is why D_o and D_e are reported alongside alpha.
-* **Ordering**: do the encoders agree on *which labs* and *which episodes* are
-  the bad ones? The audit's operational output is a ranked worklist; if the
-  ranking is encoder-specific, the worklist is an artefact. Spearman rank
-  correlations over per-lab alphas and per-episode disagreement scores test
-  exactly this, pairwise across all arms.
+* Level: does alpha itself move? D_o and D_e are reported with it, since
+  encoders squash cosine similarity into different ranges.
+* Ordering: do the encoders agree on which labs and which episodes are worst?
+  Measured by Spearman correlation over per-lab alphas and per-episode
+  disagreement scores, for every pair of arms.
 
 Embedding 125k sentences with the larger models takes tens of minutes each, so
-embedding and analysis are separate passes: run `--embed-only` once per encoder
-(resumable, cached), then `--analyze` reads the caches and never embeds.
+run `--embed-only` once per encoder (resumable, cached), then `--analyze`.
 
 Run:
     python scripts/encoder_robustness.py --embed-only --encoder mpnet
@@ -53,10 +46,8 @@ from vla_label_audit.scalable import (  # noqa: E402
     per_unit_disagreement,
 )
 
-# Chosen to differ in the ways that could plausibly matter: mpnet is the same
-# vendor but a larger backbone, gte is a different lab and training recipe,
-# bge-l is a different lab *and* 1024-d. If alpha survives all three, "it's a
-# MiniLM artefact" is off the table.
+# mpnet is the same vendor with a larger backbone, gte is a different lab and
+# training recipe, bge-l is a different lab and 1024-d.
 NEURAL = {
     "minilm": "sentence-transformers/all-MiniLM-L6-v2",
     "mpnet": "sentence-transformers/all-mpnet-base-v2",
@@ -66,9 +57,8 @@ NEURAL = {
 ENCODER_ORDER = [*NEURAL, "tfidf"]
 
 TFIDF_MAX_FEATURES = 5_000
-# One bootstrap replicate costs O(n d^2) in the Gram matmul; at d ~ 2.5-5k the
-# TF-IDF arm is 40-170x the per-replicate cost of MiniLM. 50 replicates keeps
-# the CI honest-but-wide instead of making this arm the wall-clock bottleneck.
+# A bootstrap replicate costs O(n d^2). At d ~ 2.5-5k the TF-IDF arm is 40-170x
+# the per-replicate cost of MiniLM, so it gets 50 replicates.
 TFIDF_N_BOOT = 50
 MIN_LAB_EPISODES = 30
 
@@ -76,12 +66,9 @@ MIN_LAB_EPISODES = 30
 def encoder_tag(model: str, texts: list[str]) -> str:
     """`droid_agreement.corpus_tag` with the model name as a parameter.
 
-    The original hard-codes MiniLM into the hash, so every other encoder would
-    collide onto the same cache file and silently reload MiniLM vectors. Same
-    construction, same failure-proofing (content-hashed, not length-keyed),
-    just parameterised. For the MiniLM model name this reproduces
-    ``corpus_tag`` exactly, which is what lets `--analyze` locate the existing
-    baseline cache without re-embedding.
+    `corpus_tag` hard-codes MiniLM into the hash, so other encoders would
+    collide onto the same cache file. For the MiniLM name this returns the same
+    tag as `corpus_tag`.
     """
     h = hashlib.sha256(model.encode())
     for t in texts:
@@ -91,11 +78,10 @@ def encoder_tag(model: str, texts: list[str]) -> str:
 
 
 def encoder_cache_path(key: str, texts: list[str]) -> Path:
-    """Where a given encoder's vectors for this exact corpus live on disk.
+    """Cache path for one encoder's vectors on this corpus.
 
-    MiniLM keeps the legacy un-slugged filename so the embeddings computed by
-    `droid_agreement.py` are reused rather than duplicated; every other
-    encoder gets its slug in the name so a directory listing is self-describing.
+    MiniLM keeps the filename used by `droid_agreement.py` so that cache is
+    reused.
     """
     if key == "minilm":
         return CACHE / f"embeddings_{corpus_tag(texts)}.npy"
@@ -103,15 +89,13 @@ def encoder_cache_path(key: str, texts: list[str]) -> Path:
 
 
 def embed_neural(key: str, texts: list[str]) -> np.ndarray:
-    """Embed the corpus with one encoder, cached to disk keyed by content.
+    """Embed the corpus with one encoder, cached to disk.
 
-    batch_size is 128 rather than droid_agreement's 256 because bge-large at
-    1024-d is a 1.3 GB model sharing 16 GB of unified memory with its own
-    activations; 256-sentence batches OOM the MPS allocator there.
+    batch_size is 128, not droid_agreement's 256, because bge-large runs out
+    of MPS memory at 256 on a 16 GB machine.
     """
     if key == "minilm":
-        # Delegate entirely so the existing full-corpus cache is hit and any
-        # future change to the baseline path happens in exactly one place.
+        # Reuse the existing full-corpus cache.
         return embed(texts, corpus_tag(texts))
 
     CACHE.mkdir(exist_ok=True)
@@ -135,18 +119,14 @@ def embed_neural(key: str, texts: list[str]) -> np.ndarray:
 
 
 def tfidf_arm(texts: list[str]) -> tuple[np.ndarray, np.ndarray, int, bool]:
-    """Dense TF-IDF matrix plus a mask of rows that survived.
+    """Dense TF-IDF matrix plus a mask of the rows that were kept.
 
-    This arm exists as a floor: it has no notion of meaning beyond shared
-    vocabulary, so if the neural encoders only barely beat it, the "semantic"
-    in semantic alpha is doing very little work. Dense because the alpha
-    closed form is a Gram-matrix computation; at ~2.5k vocabulary that is
-    low single-digit GB, which is fine.
+    A lexical baseline with no notion of meaning beyond shared vocabulary. It
+    is dense because the alpha closed form needs a Gram matrix.
 
-    A handful of annotations are pure punctuation ("+++++") and vectorise to
-    exactly zero, on which cosine distance is undefined -- `alpha_semantic`
-    refuses them by raising. For this arm only those rows are dropped and
-    counted; the neural arms embed every string, so they keep the full corpus.
+    A few annotations are pure punctuation ("+++++") and vectorise to zero,
+    where cosine distance is undefined. Those rows are dropped for this arm
+    only.
     """
     from sklearn.feature_extraction.text import TfidfVectorizer
 
@@ -167,9 +147,8 @@ def analyze_arm(
 ) -> tuple[dict, dict[str, float]]:
     """Corpus alpha, per-lab alphas, and per-episode scores for one encoder.
 
-    Per-lab filtering is on *multiply-annotated* episodes (``n_units``), not
-    raw episode count: an episode with a single annotation contributes nothing
-    to alpha, so a lab of 100 singletons has no agreement to estimate.
+    Labs are filtered on multiply-annotated episodes (``n_units``), since
+    single-annotation episodes contribute nothing to alpha.
     """
     sem = alpha_semantic(episodes, emb)
     _, lo, hi = bootstrap_alpha_semantic(episodes, emb, n_boot=n_boot, seed=0)
@@ -238,8 +217,7 @@ def main() -> None:
 
     episodes, texts = load_corpus(args.limit)
 
-    # Analysis must never silently fall into an hour of embedding: missing
-    # caches are a usage error ("run --embed-only first"), not work to do.
+    # Missing caches are a usage error here; analysis never embeds.
     missing = [k for k in NEURAL if not encoder_cache_path(k, texts).exists()]
     if missing:
         raise SystemExit(
@@ -251,8 +229,7 @@ def main() -> None:
             )
         )
 
-    # Nominal alpha compares strings, so it is the one encoder-independent
-    # quantity here; computed once and shared by every arm's paraphrase gap.
+    # Nominal alpha does not depend on the encoder, so compute it once.
     nom = alpha_nominal(episodes, texts)
     print(f"\nnominal alpha (encoder-independent): {nom.alpha:+.4f}")
 
@@ -289,7 +266,7 @@ def main() -> None:
         f"  ({len(summary['per_lab'])} labs, {time.perf_counter() - t0:.1f}s)"
     )
 
-    # --- does the choice of encoder change the *conclusions*? ---------------
+    # rank agreement between encoders
     lab_rho: dict[str, float] = {}
     ep_rho: dict[str, float] = {}
     for a, b in itertools.combinations(ENCODER_ORDER, 2):

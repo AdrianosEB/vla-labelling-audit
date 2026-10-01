@@ -1,30 +1,16 @@
-"""Ask the corpus a question in English and get episodes or frames back.
+"""Search the DROID and LIBERO indexes built by `scripts/build_index.py`.
 
-The audit's findings so far are statistical: an alpha, a per-lab ranking, a
-worklist of 200 episodes. What none of them support is *inspection* -- picking
-up a hypothesis ("do annotators disagree specifically about containers?", "does
-LIBERO have frames that look like the wrong instruction?") and testing it in
-seconds against 400k vectors. This is the front end onto the indexes built by
-`scripts/build_index.py`, and it exists so that hypotheses can be cheap.
+Three modes:
 
-Three modes, matching the three questions the project keeps asking:
+* ``--text-to-episodes``: DROID annotations closest in meaning to a query.
+  Each hit shows its lab and its episode's disagreement score.
+* ``--text-to-frames``: LIBERO frames that look like a description. The query
+  goes through CLIP's text tower, which shares a space with the cached image
+  vectors.
+* ``--episode-similar``: episodes described like a given one, using the mean
+  of that episode's annotation vectors as the query.
 
-* ``--text-to-episodes`` -- which DROID annotations mean roughly this? Prints
-  each hit's lab and disagreement score, so a semantic cluster that is also a
-  high-disagreement cluster is visible immediately rather than after a join.
-* ``--text-to-frames`` -- which LIBERO frames *look* like this description?
-  The query is embedded with CLIP's **text** tower, which projects into the
-  same space as the cached image-tower vectors. Embedding it with MiniLM
-  instead would return confident, meaningless neighbours -- the vectors would
-  have the wrong dimensionality here, but even a matched-dimension mismatch of
-  towers fails silently, which is why the tower is pinned in one constant.
-* ``--episode-similar`` -- which other episodes were described like this one?
-  Uses the mean of the episode's own annotation vectors, so the query is the
-  episode's consensus meaning rather than one annotator's phrasing.
-
-Search is exact by default. `--ivf` switches to the approximate index for the
-same query; the two are meant to be run back to back on a real query, because
-that comparison is more convincing about ANN recall than any aggregate.
+Search is exact by default; `--ivf` uses the approximate index.
 
 Run:
     python scripts/search.py --text-to-episodes "pick up the mug"
@@ -46,25 +32,24 @@ DATA = Path("data")
 INDEX_DIR = DATA / "index"
 
 MINILM = "sentence-transformers/all-MiniLM-L6-v2"
-# Must be the checkpoint whose *image* tower produced the cached LIBERO
-# vectors. A different CLIP checkpoint has the same 512 dims and would search
-# without complaint while returning noise.
+# Must match the checkpoint whose image tower produced the cached LIBERO
+# vectors. Another CLIP checkpoint with 512 dims would search without error
+# and return noise.
 CLIP = "openai/clip-vit-base-patch32"
 
 
 def load(name: str, use_ivf: bool, nprobe: int):
-    """Open one index plus its sidecar, failing loudly if it was never built.
+    """Open one index and its metadata sidecar.
 
-    `faiss` is imported here rather than at module scope so that the embedding
-    worker process (see `embed_query`) can import this module without ever
-    pulling faiss in -- which is the whole point of that split.
+    `faiss` is imported here, not at module scope, so the embedding worker
+    (see `embed_query`) never loads it.
     """
     import faiss
 
     suffix = "ivf" if use_ivf else "flat"
     path = INDEX_DIR / f"{name}_{suffix}.faiss"
     if not path.exists():
-        raise SystemExit(f"{path} missing -- run: python scripts/build_index.py --which all")
+        raise SystemExit(f"{path} missing; run: python scripts/build_index.py --which all")
     index = faiss.read_index(str(path))
     if use_ivf:
         index.nprobe = nprobe
@@ -73,33 +58,19 @@ def load(name: str, use_ivf: bool, nprobe: int):
 
 
 def unit(vec: np.ndarray) -> np.ndarray:
-    """Shape and normalise a query the way the indexed vectors were treated.
-
-    Skipping this turns every score into an un-normalised dot product, which
-    still ranks *plausibly* -- longer vectors simply win -- so the bug would
-    show up as subtly worse results rather than an error.
-    """
+    """Reshape and L2-normalise a query to match the indexed vectors."""
     vec = np.ascontiguousarray(vec, dtype=np.float32).reshape(1, -1)
     return vec / max(float(np.linalg.norm(vec)), 1e-12)
 
 
 def embed_query(kind: str, text: str) -> np.ndarray:
-    """Embed a query string in a *child process*, and return the vector.
+    """Embed a query string in a child process and return the vector.
 
-    torch and faiss-cpu each bring their own OpenMP runtime on macOS, and in
-    this environment loading both into one interpreter is fatal: whichever
-    library enters a parallel region second dies with SIGSEGV, with no Python
-    traceback and no stderr. Measured here both ways round -- faiss imported
-    first kills CLIP's forward pass; torch first kills `Index.search` -- so
-    import order cannot fix it and neither can pinning either library to one
-    thread or setting KMP_DUPLICATE_LIB_OK.
-
-    Splitting the two into separate processes is therefore not defensive
-    tidiness, it is the only arrangement that runs. The child imports torch and
-    never faiss; the parent imports faiss and never torch; a temporary .npy
-    carries the single query vector between them. The cost is one interpreter
-    start plus a model load per query, which is dominated by the model load
-    that a single-query CLI would have paid anyway.
+    torch and faiss-cpu each ship their own OpenMP runtime on macOS, and loading
+    both in one interpreter segfaults with no traceback, whichever is imported
+    first. Pinning threads or setting KMP_DUPLICATE_LIB_OK does not help. So
+    the child imports torch and never faiss, the parent imports faiss and never
+    torch, and a temporary .npy carries the vector between them.
     """
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "query.npy"
@@ -128,16 +99,12 @@ def _embed_worker(kind: str, text: str, out: Path) -> None:
 
 
 def embed_clip_text(text: str) -> np.ndarray:
-    """Project a query into CLIP's shared image/text space via the text tower.
+    """Embed a query with CLIP's text tower, in the shared image/text space.
 
-    `CLIPTextModelWithProjection` is used rather than the more obvious
-    `CLIPModel.get_text_features` because on transformers 5.x the latter
-    returns a `BaseModelOutputWithPooling`, not a tensor, and its
-    `pooler_output` is the **pre**-projection hidden state. For ViT-B/32 that
-    state is also 512-d, so taking it would search this index without raising
-    anything and return confident nonsense -- the failure has no symptom. This
-    class returns `text_embeds`, the post-projection vector that is the true
-    counterpart of the `image_embeds` cached by `libero_embed.py`.
+    Uses `CLIPTextModelWithProjection` because on transformers 5.x
+    `CLIPModel.get_text_features` returns a `BaseModelOutputWithPooling` whose
+    `pooler_output` is the pre-projection hidden state. For ViT-B/32 that is
+    also 512-d, so it would search without error and return wrong results.
     """
     import torch
     from transformers import CLIPTextModelWithProjection, CLIPTokenizer
@@ -182,13 +149,10 @@ def text_to_frames(query: str, k: int, use_ivf: bool, nprobe: int) -> None:
 
 
 def episode_similar(episode_id: str, k: int, use_ivf: bool, nprobe: int) -> None:
-    """Nearest *other* episodes to one episode's consensus meaning.
+    """Nearest other episodes to one episode's mean annotation vector.
 
-    Over-fetches before deduplicating because the index is per annotation, not
-    per episode: an episode with three near-identical annotations would
-    otherwise eat three of the k slots and the answer would be shorter than
-    asked for. Each surviving episode is represented by its best-scoring
-    annotation, which is also the one worth reading.
+    The index is per annotation, so this over-fetches and keeps the
+    best-scoring annotation per episode.
     """
     index, meta = load("droid_text", use_ivf, nprobe)
     episodes = meta["episode_id"]
@@ -198,8 +162,7 @@ def episode_similar(episode_id: str, k: int, use_ivf: bool, nprobe: int) -> None
 
     import faiss
 
-    # Averaging the annotations first, then normalising, gives the centroid
-    # direction of how the episode was described -- not any one annotator's.
+    # query = normalised mean of the episode's annotation vectors
     flat = faiss.read_index(str(INDEX_DIR / "droid_text_flat.faiss"))
     query = unit(np.mean([flat.reconstruct(int(r)) for r in rows], axis=0))
 
@@ -233,8 +196,7 @@ def episode_similar(episode_id: str, k: int, use_ivf: bool, nprobe: int) -> None
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    # The worker flags are internal plumbing for `embed_query`, not UI; they
-    # are hidden so `--help` still describes a three-mode search tool.
+    # Internal flags used by `embed_query`; hidden from --help.
     ap.add_argument("--_embed", choices=("minilm", "clip"), help=argparse.SUPPRESS)
     ap.add_argument("--_text", help=argparse.SUPPRESS)
     ap.add_argument("--_out", help=argparse.SUPPRESS)

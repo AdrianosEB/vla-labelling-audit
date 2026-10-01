@@ -1,10 +1,7 @@
 """End-to-end audit on a synthetic corpus with a known amount of planted noise.
 
-Not an experiment. It exists so the pipeline can be validated where the answer
-is known before any real dataset is attached: a corpus is built with a chosen
-fraction of deliberately wrong labels, and the audit has to find roughly that
-fraction. If it cannot recover a planted 20%, nothing it says about DROID is
-worth reading.
+A sanity check, not an experiment: the corpus is built with a chosen fraction
+of wrong labels, and the audit should recover roughly that fraction.
 
 Run:  python scripts/demo_synthetic.py
 """

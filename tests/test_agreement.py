@@ -58,9 +58,8 @@ def test_systematic_disagreement_goes_negative():
 def test_semantic_and_exact_match_disagree_on_paraphrase():
     """The gap between the two views is the paraphrase rate.
 
-    Strings differ everywhere, so nominal alpha sees total disagreement; the
-    embeddings are near-identical within units, so semantic alpha sees near-
-    perfect agreement. That gap is exactly the quantity this project reports.
+    Strings differ everywhere, so nominal alpha sees total disagreement. The
+    embeddings are near-identical within units, so semantic alpha is near 1.
     """
     rng = np.random.default_rng(3)
     base = rng.normal(size=(30, 8))

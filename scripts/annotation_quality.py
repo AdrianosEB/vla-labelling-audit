@@ -1,29 +1,21 @@
-"""What is actually wrong with the text in DROID's annotation file?
+"""Count defective annotations in DROID's annotation file.
 
-`droid_agreement.py` answers "do the annotators agree". This script answers the
-prior question: are the annotations well-formed sentences at all? Agreement
-computed over a corpus that silently contains truncated fragments and "N/A"
-placeholders is measuring something other than what it claims to.
+Four defect classes:
 
-Four defect classes are counted, each defined narrowly enough to be auditable:
+* truncated: cut off mid-word ("Turn on the kett", "Close the cof").
+* no terminal punctuation: reported for completeness. At ~91% it is the house
+  style and not really a defect.
+* non-answer: the annotator declined ("N/A", "Unsure", "No action").
+* junk: non-linguistic ("+++++++", a bare "g").
 
-* **truncated** -- cut off mid-word ("Turn on the kett", "Close the cof").
-* **no terminal punctuation** -- reported for completeness, but see below: at
-  ~91% this is the house style, not a defect.
-* **non-answer** -- the annotator explicitly declined ("N/A", "Unsure",
-  "No action").
-* **junk** -- non-linguistic ("+++++++", a bare "g").
+The script also checks whether truncation comes from a character limit in the
+annotation tool. A limit would show up as a spike in the length histogram and
+as truncated annotations sharing one length. It tests both, plus association
+with lab, collection date, and the length of the other annotations on the same
+episode. The truncation detector uses no episode-level signal, so the
+sibling-length test is not circular.
 
-The headline question this script was built to settle is whether truncation is
-an *annotation-tool* artefact -- a hard character limit silently cutting text.
-That predicts (a) a spike in the length histogram at the cap and (b) truncated
-annotations clustering at one length. Both are tested, plus association with
-lab, with collection date, and with how long the *other* annotators on the same
-episode wrote. Note that the truncation detector deliberately uses no episode-level
-signal, so the sibling-length test is not circular.
-
-Finally, semantic alpha is recomputed with each class excluded in turn, so the
-cost of leaving the junk in is stated as a number rather than assumed.
+Semantic alpha is then recomputed with each class excluded in turn.
 
 Run:
     python scripts/annotation_quality.py              # full file
@@ -52,8 +44,8 @@ WORD = re.compile(r"[a-z]+")
 TERMINAL = frozenset(".!?")
 SYSTEM_DICT = Path("/usr/share/dict/words")
 
-# Whole-string non-answers. Matched against the lower-cased, whitespace-collapsed
-# text, anchored, so an instruction that merely *contains* "none" is untouched.
+# Whole-string non-answers, matched against lower-cased text. Anchored, so an
+# instruction that only contains "none" does not match.
 NON_ANSWER = re.compile(
     r"^(?:"
     r"n/?a|null|none|nan|nil|"
@@ -67,10 +59,8 @@ NON_ANSWER = re.compile(
 def load_rows(raw: dict, limit: int | None = None) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Every annotation slot that holds text, normalised but not filtered.
 
-    Deliberately *not* `droid_agreement.flatten`: that function drops empties,
-    which is right for agreement and wrong here, since the point is to count what
-    gets dropped. Absent slots (12,500 episodes carry only `instruction1`) are
-    skipped -- a slot nobody was asked to fill is not a defective annotation.
+    Absent slots are skipped (12,500 episodes carry only `instruction1`),
+    since a slot nobody was asked to fill is not a defective annotation.
     """
     episodes, slots, texts = [], [], []
     for i, (episode, fields) in enumerate(raw.items()):
@@ -90,19 +80,17 @@ def load_rows(raw: dict, limit: int | None = None) -> tuple[np.ndarray, np.ndarr
 
 
 def load_dictionary() -> set[str]:
-    """The system word list, used only to *veto* truncation calls.
+    """The system word list, used only to veto truncation calls.
 
-    /usr/share/dict/words is far too sparse to detect truncation on its own --
-    it lacks "box", "countertop", "laptop" -- so it is never used to mark a word
-    as broken. It is used in one direction only: if a word IS listed, it is a
-    real word, so "stop" and "diagonal" cannot be mistaken for cut-off
-    "stopper" and "diagonally".
+    /usr/share/dict/words is too sparse to detect truncation by itself (it
+    lacks "box", "countertop", "laptop"), so it never marks a word as broken.
+    It only clears words: if "stop" or "diagonal" is listed, it is not treated
+    as a cut-off "stopper" or "diagonally".
 
-    The veto applies only to tokens of four characters or more (see
-    `flag_truncated`). This list carries every single letter as an entry plus a
-    long tail of obscure short words -- "ta", "po", "gar" and "pac" are all in
-    it -- so vetoing on short tokens discards the clearest truncations in the
-    file ("in the clear b", "the silver bot").
+    `flag_truncated` applies the veto only to tokens of four or more characters.
+    The list includes every single letter and many obscure short words ("ta",
+    "po", "gar", "pac"), so vetoing short tokens would discard the clearest
+    truncations in the file ("in the clear b", "the silver bot").
     """
     if not SYSTEM_DICT.exists():
         return set()
@@ -111,24 +99,20 @@ def load_dictionary() -> set[str]:
 
 
 def flag_truncated(texts: list[str], words: set[str]) -> np.ndarray:
-    """Mid-word truncation, judged against the corpus's own vocabulary.
+    """Flag mid-word truncation using the corpus's own vocabulary.
 
-    A truncated tail like "kett" is rare as a complete token yet is a prefix of
-    tokens that are common ("kettle"). That ratio is the signal. Building the
-    vocabulary from DROID itself rather than an external dictionary keeps the
-    test in-domain, which matters when the domain is 2,500 words of tabletop
-    manipulation vocabulary.
+    A truncated tail like "kett" is rare as a whole token but is a prefix of
+    common tokens ("kettle"). The vocabulary is built from DROID itself, which
+    is about 2,500 words of tabletop manipulation, so the test stays in-domain.
 
-    Three guards keep precision high, which is what matters when the base rate
-    is a handful in 125,000: the annotation must not end in terminal punctuation,
-    the tail must appear at most twice as a whole word, and a tail of four or
-    more characters must not be a real dictionary word.
+    An annotation is flagged only if it does not end in terminal punctuation,
+    its last word appears at most twice as a whole word, and that word (if four
+    or more characters) is not in the dictionary.
 
-    The residual ambiguity is genuine and irreducible from text alone: "Move the
-    mic" is flagged because "mic" occurs once as a whole word against ~1,000
-    occurrences of longer "mic-" words, but it could be a complete instruction
-    about a microphone. The flagged set is small enough that the script prints
-    all of it for inspection rather than asking to be trusted.
+    Some calls stay ambiguous. "Move the mic" is flagged because "mic" occurs
+    once as a whole word against ~1,000 longer "mic-" words, but it could be a
+    complete instruction about a microphone. The flagged set is small, so the
+    script prints all of it for inspection.
     """
     vocab: collections.Counter = collections.Counter()
     for text in texts:
@@ -165,9 +149,8 @@ def flag_non_answer(texts: list[str]) -> np.ndarray:
 def flag_junk(texts: list[str]) -> np.ndarray:
     """Non-linguistic strings: no word content, or a single repeated character.
 
-    Kept separate from `non_answer` because they mean different things. A
-    non-answer is an annotator telling you they could not describe the episode,
-    which is information. Junk is a broken input box.
+    Kept separate from non-answers: a non-answer means the annotator could not
+    describe the episode, while junk is a bad input.
     """
     flags = np.zeros(len(texts), dtype=bool)
     for i, text in enumerate(texts):
@@ -191,8 +174,8 @@ def describe_lengths(texts: list[str]) -> None:
         )
     print(f"\n  mean {chars.mean():.1f} chars, {words.mean():.1f} words")
 
-    # A hard tool limit would pile annotations up against the cap. Show the
-    # densest lengths in the upper tail so its absence is visible, not asserted.
+    # A hard tool limit would pile annotations up at the cap, so print the most
+    # common lengths in the top decile.
     counts = collections.Counter(chars.tolist())
     tail = [(L, c) for L, c in counts.items() if L >= np.percentile(chars, 90)]
     tail.sort(key=lambda kv: -kv[1])
@@ -203,7 +186,7 @@ def describe_lengths(texts: list[str]) -> None:
 def truncation_diagnostics(
     episodes: np.ndarray, texts: list[str], trunc: np.ndarray
 ) -> dict:
-    """Is truncation a tool artefact? Test against length, lab, date, siblings."""
+    """Test truncation against length, lab, date and sibling annotation length."""
     out: dict = {}
     n_trunc = int(trunc.sum())
     chars = np.array([len(t) for t in texts])
@@ -216,14 +199,14 @@ def truncation_diagnostics(
     print(f"  their lengths (chars): {lengths}")
     print(f"  distinct lengths: {len(set(lengths))} of {n_trunc}")
     out["truncated_lengths"] = lengths
-    # A fixed-width cut leaves nearly every truncated string the same length.
+    # A fixed-width cut would leave most truncated strings the same length.
     out["length_concentration"] = len(set(lengths)) / n_trunc
 
     print("\n  the truncated annotations:")
     for ep, text in sorted(zip(episodes[trunc].tolist(), [texts[i] for i in np.flatnonzero(trunc)])):
         print(f"     {ep.split('+')[0]:<9} {text!r}")
 
-    # --- lab ---------------------------------------------------------------
+    # By lab.
     labs = np.array([e.split("+")[0] for e in episodes])
     table, names = [], []
     for lab in np.unique(labs):
@@ -239,11 +222,11 @@ def truncation_diagnostics(
     low = int((expected < 5).sum())
     print(f"     chi2 = {chi2:.2f}, p = {p_lab:.3f}")
     if low:
-        print(f"     WARNING: {low} of {expected.size} expected counts < 5 -- chi2 is unreliable here")
+        print(f"     WARNING: {low} of {expected.size} expected counts < 5; chi2 is unreliable here")
     out["lab_chi2_p"] = float(p_lab)
     out["lab_low_expected_cells"] = low
 
-    # --- date --------------------------------------------------------------
+    # By collection month.
     months = np.array([e.split("+")[2][:7] for e in episodes])
     uniq = sorted(set(months.tolist()))
     mtable = np.array([[int(((months == m) & trunc).sum()),
@@ -257,13 +240,12 @@ def truncation_diagnostics(
     print(f"     chi2 = {chi2_m:.2f}, p = {p_month:.3f}")
     low_m = int((exp_m < 5).sum())
     if low_m:
-        print(f"     WARNING: {low_m} of {exp_m.size} expected counts < 5 -- chi2 is unreliable here")
+        print(f"     WARNING: {low_m} of {exp_m.size} expected counts < 5; chi2 is unreliable here")
     out["month_chi2_p"] = float(p_month)
     out["month_low_expected_cells"] = low_m
 
-    # --- sibling length ----------------------------------------------------
-    # If a tool clipped the input, the annotator's intent was longer, and the
-    # co-annotators (unclipped) should look long by comparison.
+    # Sibling length. If a tool clipped the input, the other annotations on the
+    # same episode should be longer than usual.
     by_ep: dict[str, list[int]] = collections.defaultdict(list)
     for i, ep in enumerate(episodes.tolist()):
         by_ep[ep].append(i)
@@ -304,7 +286,7 @@ def alpha_deltas(
     for name, flags in classes.items():
         n_drop = int(flags.sum())
         if n_drop == 0:
-            print(f"  excl. {name:<13} (none found -- alpha unchanged)")
+            print(f"  excl. {name:<13} (none found, alpha unchanged)")
             out[name] = {"n_dropped": 0, "delta": 0.0}
             continue
         keep = ~flags
@@ -322,13 +304,12 @@ def alpha_deltas(
             f"  excl. {name:<13} alpha {res.alpha:+.4f}  95% CI [{klo:.4f}, {khi:.4f}]"
             f"   delta {delta:+.4f}   (-{n_drop:,} annotations, -{lost_units:,} episodes)"
         )
-        # Excluding a majority of the corpus does not measure the cost of a
-        # defect, it measures a different corpus. Say so rather than let the
-        # delta be read as comparable to the others.
+        # Dropping most of the corpus gives a different corpus, so this delta is
+        # not comparable to the others.
         if n_drop > 0.5 * flags.size:
             print(
                 f"       ^ this drops {n_drop/flags.size:.0%} of all annotations and leaves "
-                f"{res.n_units:,} episodes -- not a defect class, and not comparable above"
+                f"{res.n_units:,} episodes; not a defect class, and not comparable above"
             )
         out[name] = {
             "n_dropped": n_drop,
@@ -378,10 +359,8 @@ def main() -> None:
             texts[i] for i in np.flatnonzero(nonans)
         ).most_common():
             print(f"     {count:>3}x {text!r}")
-        # Where they sit matters more than how many there are. An episode whose
-        # annotators *all* wrote "No action" contributes a perfectly-agreeing
-        # unit to alpha while containing no instruction to agree about, so it
-        # inflates the headline number rather than adding noise to it.
+        # An episode where every annotator wrote "No action" counts as perfect
+        # agreement and inflates alpha, so report how many of those there are.
         grouped: dict[str, list[int]] = collections.defaultdict(list)
         for i, ep in enumerate(episodes.tolist()):
             grouped[ep].append(i)

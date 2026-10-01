@@ -1,32 +1,21 @@
 """Krippendorff's alpha at corpus scale, without an N-by-N distance matrix.
 
-DROID's annotation file holds roughly 50,000 episodes with three instructions
-each -- about 150,000 sentences. The textbook formulation of alpha needs the
-full pairwise difference matrix, which at that size is 150,000^2 float32
-entries: **90 GB**. On a 16 GB laptop that is not a slow computation, it is an
-impossible one.
+DROID has about 150,000 annotations. The textbook formulation needs the full
+pairwise difference matrix, which at that size is 90 GB in float32. Alpha is a
+ratio of two terms, and neither needs that matrix:
 
-It is also unnecessary. Alpha is a ratio of two terms with very different
-structure:
+* Observed disagreement only involves annotations within the same episode.
 
-* **Observed disagreement** only involves annotations *within* the same
-  episode. At three annotations each that is six ordered pairs per episode --
-  300,000 distance computations total, not 22.5 billion.
-
-* **Expected disagreement** does involve every pair, but for squared cosine
-  distance on L2-normalised vectors it has a closed form. Writing
-  ``s_ij = x_i . x_j`` and expanding ``(1 - s_ij)^2``:
+* Expected disagreement involves every pair, but for squared cosine distance
+  on L2-normalised vectors it has a closed form. With ``s_ij = x_i . x_j``:
 
       sum_ij (1 - s_ij)^2 = n^2 - 2 * ||sum_i x_i||^2 + ||X^T X||_F^2
 
-  The first sum collapses to the squared norm of the mean direction. The second
-  collapses to the Frobenius norm of the ``d x d`` Gram matrix, because
-  ``sum_ij (x_i . x_j)^2 = trace(M M)`` for ``M = X^T X``. Both cost O(n d^2)
-  time and O(d^2) memory -- at d = 384 that is a 384x384 matrix regardless of
-  whether n is a thousand or a billion.
+  since ``sum_ij (x_i . x_j)^2 = trace(M M)`` for ``M = X^T X``. This costs
+  O(n d^2) time and O(d^2) memory.
 
-The result is exact, not approximate. The tests check it against the naive
-implementation to floating-point tolerance.
+The result is exact. The tests check it against the naive implementation in
+``agreement.py``.
 """
 
 from __future__ import annotations
@@ -58,12 +47,10 @@ def alpha_semantic(unit_ids: Sequence, embeddings: np.ndarray) -> AgreementResul
 
     Args:
         unit_ids: ``[N]`` episode identifier per annotation.
-        embeddings: ``[N, d]`` sentence embeddings, any scaling (normalised
-            internally).
+        embeddings: ``[N, d]`` sentence embeddings (normalised internally).
 
     Returns:
-        The same :class:`AgreementResult` the naive implementation returns, so
-        the two are drop-in interchangeable.
+        The same :class:`AgreementResult` as the naive implementation.
     """
     unit_ids = np.asarray(unit_ids)
     x = np.asarray(embeddings, dtype=np.float64)
@@ -80,7 +67,7 @@ def alpha_semantic(unit_ids: Sequence, embeddings: np.ndarray) -> AgreementResul
     if not groups:
         raise ValueError("no unit has 2+ annotations; alpha is undefined")
 
-    # --- observed: within-episode pairs only -------------------------------
+    # observed: within-episode pairs only
     total = 0.0
     n = 0
     for g in groups:
@@ -90,7 +77,7 @@ def alpha_semantic(unit_ids: Sequence, embeddings: np.ndarray) -> AgreementResul
         n += g.size
     d_obs = total / n
 
-    # --- expected: closed form over the pairable pool ----------------------
+    # expected: closed form over the pairable pool
     pool = x[np.concatenate(groups)]
     v = pool.sum(axis=0)
     gram = pool.T @ pool
@@ -102,15 +89,10 @@ def alpha_semantic(unit_ids: Sequence, embeddings: np.ndarray) -> AgreementResul
 
 
 def alpha_nominal(unit_ids: Sequence, labels: Sequence) -> AgreementResult:
-    """Alpha under exact string identity, also in linear time.
+    """Alpha under exact string identity, in linear time.
 
-    Expected disagreement for the nominal difference function is just the
-    probability that two annotations drawn from the pool differ, which follows
-    from the value counts alone.
-
-    Report this next to :func:`alpha_semantic`. The gap between them is the
-    share of apparent disagreement that is only paraphrase -- annotators who
-    described the same behaviour in different words.
+    Expected disagreement here is the probability that two annotations drawn
+    from the pool differ, which follows from the value counts alone.
     """
     unit_ids = np.asarray(unit_ids)
     lab = np.asarray(labels, dtype=object)
@@ -148,20 +130,12 @@ def bootstrap_alpha_semantic(
 ) -> tuple[float, float, float]:
     """Percentile CI for the semantic alpha, resampling whole episodes.
 
-    A resample draws episodes with replacement, so episode ``i`` appears
-    ``c_i`` times. Every term in alpha is linear in those counts except the
-    Gram term, which is quadratic -- so the replicate reduces to:
+    Each replicate recomputes the weighted Gram ``X^T diag(w) X``, where ``w``
+    repeats each episode's resample count across its annotations. The other
+    terms are weighted sums of per-episode quantities computed once.
 
-    * ``n``, ``D_o`` numerator, and ``v`` : weighted sums of per-episode
-      quantities precomputed once. Nearly free.
-    * the Gram term: ``X^T diag(w) X`` where ``w`` repeats each episode's count
-      across its annotations. One ``[d, N] @ [N, d]`` matmul per replicate.
-
-    The tempting optimisation -- caching one ``d x d`` Gram per episode and
-    summing the picked ones -- is what the first version of this function did,
-    and it is catastrophic at the scale this module exists for: 50,000 episodes
-    x 384 x 384 float64 is **59 GB**. Recomputing the weighted Gram each
-    replicate costs one matmul and O(N d) memory instead.
+    Do not cache one ``d x d`` Gram per episode instead. An earlier version did,
+    and at 50,000 episodes x 384 x 384 float64 that is 59 GB.
 
     Returns:
         ``(alpha, low, high)``.
@@ -208,12 +182,7 @@ def bootstrap_alpha_semantic(
 
 
 def per_unit_disagreement(unit_ids: Sequence, embeddings: np.ndarray) -> dict:
-    """Mean within-episode squared cosine distance, computed group by group.
-
-    The operational output of the audit. Corpus alpha is the headline; this is
-    the ranked worklist -- it turns "check 50,000 episodes" into "check the
-    worst 200", which is a task a person can actually do in an afternoon.
-    """
+    """Mean within-episode squared cosine distance, one score per episode."""
     unit_ids = np.asarray(unit_ids)
     x = np.asarray(embeddings, dtype=np.float64)
     x = x / np.linalg.norm(x, axis=1, keepdims=True)

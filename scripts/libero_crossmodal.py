@@ -1,35 +1,23 @@
 """Do LIBERO's 40 instructions describe the trajectories they are attached to?
 
-Session 2's whole premise is that a label error is visible as a *geometric*
-anomaly: an episode whose visual neighbours all carry a different instruction is
-either mislabelled or genuinely odd. That premise only buys anything if two
-things hold, and this script measures both rather than assuming either.
+The detector flags an episode when its visual neighbours carry a different
+instruction. This script measures two things that have to hold for that to work.
 
-**Does vision know the task at all?** The headline here is visual-neighbourhood
-task purity: the fraction of an episode's k visual nearest neighbours carrying
-its own ``task_index``, against the exact chance baseline
-``sum_t n_t(n_t-1)/(N(N-1))``. If purity is at chance the detector is dead on
-arrival, because there is no signal for a wrong label to contradict. This
-replaces the visual-vs-language kNN Jaccard that played the headline role in the
-DROID half: LIBERO has 40 instructions for 1,693 episodes, so the language view
-contains 40 distinct vectors and "language nearest neighbour" is a coin flip
-among the ~42 episodes sharing an identical vector. That overlap is still
-computed (§3) precisely so the degeneracy is on the record with the tie-group
-sizes that cause it, not quietly omitted.
+Visual-neighbourhood task purity: the fraction of an episode's k visual nearest
+neighbours that share its ``task_index``, against the exact chance baseline
+``sum_t n_t(n_t-1)/(N(N-1))``. At chance purity there is no signal for a wrong
+label to contradict. The visual-vs-language kNN Jaccard used on DROID is not the
+headline here because LIBERO has 40 instructions for 1,693 episodes, so each
+language vector is shared by ~42 episodes and its neighbours are arbitrary. That
+overlap is still computed (step 3) and reported with the tie-group sizes.
 
-**Does the detector actually find planted errors?** LIBERO's labels are correct
-by construction, so on the unmodified corpus the detector can only demonstrate
-specificity -- it cannot demonstrate that it recovers anything, because there is
-nothing to recover. The label-swap calibration (§7) injects a known set of wrong
-labels by permuting instructions across task boundaries and measures ROC AUC,
-precision@50, precision@200 and recall@200 against that known set, over many
-seeds. Those numbers, not the unmodified ranking, are what license the claim
-that the ranked worklist is worth a human's time.
+Label-swap calibration (step 7): LIBERO's labels are correct by construction, so
+the unmodified corpus can only show specificity. Known wrong labels are injected
+by permuting instructions across task boundaries, and ROC AUC, precision@50,
+precision@200 and recall@200 are measured against that set over several seeds.
 
-Everything is exact: brute-force cosine kNN over 1,693 episode vectors, no ANN.
-
-Cost is dominated by two things that are cached to disk and never redone: mean
-pooling 273,465 frame embeddings into episode vectors (~2 GB of reads), and AV1
+kNN is exact brute-force cosine over 1,693 episode vectors. The two expensive
+steps are cached: mean pooling 273,465 frame embeddings (~2 GB of reads) and AV1
 decode for the contact sheets. ``--analyze`` reads the cached views only.
 
 Run:
@@ -76,18 +64,14 @@ N_EPISODES = 1693
 
 VISUAL_ENCODERS = ["dinov2", "clip"]
 CAMERAS = {"image": "observation.images.image", "image2": "observation.images.image2"}
-# Both language encoders are already used elsewhere in this project, so the
-# choice cannot be accused of being tuned to this result. MiniLM is the primary
-# (it is the baseline every DROID number is quoted against); mpnet is carried
-# through the diagnostics as the "does the sentence encoder matter" arm.
+# Same two language encoders as the DROID analysis. MiniLM is the primary; mpnet
+# is the second arm for checking whether the sentence encoder matters.
 LANGUAGE_ENCODERS = {
     "minilm": "sentence-transformers/all-MiniLM-L6-v2",
     "mpnet": "sentence-transformers/all-mpnet-base-v2",
 }
 PRIMARY_LANGUAGE = "minilm"
-# The suspect ranking queries with both cameras concatenated: the wrist and the
-# scene camera see different halves of a manipulation, and there is no reason to
-# throw one away when the index is 1,693 vectors either way.
+# The suspect ranking uses both cameras concatenated (wrist and scene).
 PRIMARY_VISUAL_BLOCK = "concat"
 
 PURITY_KS = [1, 5, 10, 25]
@@ -110,9 +94,7 @@ SUSPECTS_CSV = RESULTS / "libero_suspects.csv"
 SHEET_DIR = RESULTS / "suspects"
 
 
-# --------------------------------------------------------------------------
-# view construction
-# --------------------------------------------------------------------------
+# View construction
 
 
 def load_index() -> dict:
@@ -127,16 +109,13 @@ def load_index() -> dict:
 
 
 def pool_visual(encoder: str, camera_key: str, idx: dict) -> np.ndarray:
-    """Frame embeddings -> one unit vector per episode.
+    """Pool frame embeddings into one unit vector per episode.
 
-    Normalise each frame, mean-pool, normalise again. The first normalisation is
-    what makes the pool a mean *direction* rather than a mean weighted by vector
-    magnitude -- neither DINOv2's CLS norm nor CLIP's projected norm is a
-    meaningful per-frame importance weight, and without it a handful of
-    large-norm frames would decide the episode's position in the index.
+    Frames are normalised before mean pooling so that large-norm frames do not
+    dominate the episode vector, then the mean is normalised again.
 
-    Read episode by episode off a memmap: the cached matrices are 400-560 MB
-    each and four of them at once would be most of this machine's 16 GB.
+    Reads episode by episode off a memmap. The cached matrices are 400-560 MB
+    each, and loading all four would use most of a 16 GB machine.
     """
     path = CACHE / f"libero_emb_{encoder}_{camera_key}_{N_ROWS}_{DATASET_TAG}.npy"
     frames = np.load(path, mmap_mode="r")
@@ -154,24 +133,18 @@ def pool_visual(encoder: str, camera_key: str, idx: dict) -> np.ndarray:
 
 
 def build_action_view(idx: dict) -> tuple[np.ndarray, list[str]]:
-    """A fixed-length per-episode summary of state and action.
+    """A fixed-length per-episode summary of state and action (135 dims).
 
-    Episodes differ in length (74-758 frames), so the action view has to be a
-    summary, and the summary has to be honest about what it throws away. Two
-    kinds of feature, for two kinds of structure:
+    Episodes vary in length (74-758 frames), so each is summarised by:
 
-    * moments -- mean, std, min, max of each of the 8 state dims and 7 action
-      dims (60 numbers) -- which capture *where in the workspace* and *how
-      vigorously* the arm moved but nothing about order;
-    * waypoints -- state and action at 5 uniformly spaced fractions of the
-      episode, 0, 0.25, 0.5, 0.75, 1 (75 numbers) -- which restore coarse
-      temporal order, so that "reach then lift" and "lift then reach" are not
-      identical points.
+    * moments: mean, std, min, max of the 8 state dims and 7 action dims
+      (60 numbers). These carry no information about order.
+    * waypoints: state and action at fractions 0, 0.25, 0.5, 0.75, 1 of the
+      episode (75 numbers), which add coarse temporal order.
 
-    135 dims total. Columns are z-scored across episodes before use because the
-    raw units are incommensurable (gripper width in metres against joint
-    velocities); without it, cosine geometry would be dominated by whichever
-    dimension happens to have the largest scale.
+    Columns are z-scored across episodes because the raw units differ (gripper
+    width in metres, joint velocities) and the largest scale would otherwise
+    dominate cosine distance.
     """
     lengths = idx["episode_length"]
     state = [None] * N_EPISODES
@@ -214,15 +187,15 @@ def build_action_view(idx: dict) -> tuple[np.ndarray, list[str]]:
     raw = np.stack(rows)
 
     mu, sd = raw.mean(0), raw.std(0)
-    # A constant column carries no information and would divide by zero; leave it
-    # at zero rather than dropping it, so the column names stay aligned.
+    # Constant columns stay at zero (instead of being dropped) so the column
+    # names stay aligned.
     sd_safe = np.where(sd > 0, sd, 1.0)
     z = (raw - mu) / sd_safe
     return z, names
 
 
 def embed_instructions(model_name: str, texts: list[str]) -> np.ndarray:
-    """Embed the 40 instruction strings. 40 sentences is a fraction of a second."""
+    """Embed the 40 instruction strings."""
     from sentence_transformers import SentenceTransformer
     import torch
 
@@ -246,8 +219,8 @@ def build_views() -> None:
             store[f"visual_{enc}_{cam}"] = v
             per_cam.append(v)
             print(f"  {enc}/{cam}: {v.shape} pooled in {time.perf_counter() - t0:.1f}s")
-        # Concatenating two unit vectors then renormalising is exactly averaging
-        # the two cameras' cosine similarities, which is the intended semantics.
+        # Concatenating two unit vectors and renormalising averages the two
+        # cameras' cosine similarities.
         store[f"visual_{enc}_concat"] = normalize(np.hstack(per_cam))
 
     t0 = time.perf_counter()
@@ -289,17 +262,14 @@ def visual_blocks(views: dict) -> dict[str, np.ndarray]:
     return out
 
 
-# --------------------------------------------------------------------------
-# measurements
-# --------------------------------------------------------------------------
+# Measurements
 
 
 def chance_purity(task_index: np.ndarray) -> float:
-    """Exact probability that two distinct episodes drawn at random share a task.
+    """Probability that two distinct episodes drawn at random share a task.
 
-    ``sum_t n_t(n_t-1) / (N(N-1))``. Not ``sum_t (n_t/N)^2``: neighbours are
-    drawn without replacement from the other N-1 episodes, and at n_t ~ 42 the
-    difference is not negligible.
+    ``sum_t n_t(n_t-1) / (N(N-1))``, not ``sum_t (n_t/N)^2``, because neighbours
+    are drawn without replacement. At n_t ~ 42 the difference matters.
     """
     _, counts = np.unique(task_index, return_counts=True)
     n = task_index.shape[0]
@@ -309,15 +279,11 @@ def chance_purity(task_index: np.ndarray) -> float:
 def purity_curve(view: np.ndarray, task_index: np.ndarray, ks: list[int]) -> dict:
     """Mean task purity at several k, with an episode-clustered bootstrap CI.
 
-    The kNN graph is computed once at max(ks) and prefixes are taken, which is
-    valid because ``knn_indices`` returns neighbours sorted by decreasing
-    similarity.
+    The kNN graph is computed once at max(ks) and prefixes are taken, which
+    relies on ``knn_indices`` returning neighbours sorted by similarity.
 
-    The bootstrap resamples *episodes* -- the unit of analysis and the unit of
-    correlation -- holding the neighbour graph fixed. Resampling the graph too
-    would answer a different question (how purity varies over redrawn corpora of
-    this size); what is wanted here is the sampling error of the mean over the
-    episodes actually observed.
+    The bootstrap resamples episodes with the neighbour graph held fixed, so the
+    CI is the sampling error of the mean over the observed episodes.
     """
     nn = knn_indices(view, max(ks))
     same = task_index[nn] == task_index[:, None]
@@ -341,11 +307,9 @@ def purity_curve(view: np.ndarray, task_index: np.ndarray, ks: list[int]) -> dic
 def tie_group_sizes(task_index: np.ndarray) -> dict:
     """How many episodes share each episode's exact instruction vector.
 
-    This is the whole explanation for the degenerate language-side kNN: with 40
-    instructions over 1,693 episodes, an episode's 10 "language nearest
-    neighbours" are 10 arbitrary members of a tie group two orders of magnitude
-    larger than k, so the expected Jaccard against any other view is essentially
-    a lottery.
+    With 40 instructions over 1,693 episodes, an episode's 10 language nearest
+    neighbours are 10 arbitrary members of a much larger tie group, which is why
+    the language-side kNN overlap is degenerate.
     """
     _, counts = np.unique(task_index, return_counts=True)
     per_ep = counts[task_index]
@@ -357,8 +321,8 @@ def tie_group_sizes(task_index: np.ndarray) -> dict:
         "group_size_max": int(counts.max()),
         "group_sizes": [int(c) for c in np.sort(counts)[::-1]],
         "mean_tie_group_size_per_episode": float(per_ep.mean()),
-        # k language neighbour slots can hold at most this fraction of the tie
-        # group they are drawn from -- the ceiling on any language-side overlap.
+        # Upper bound on language-side overlap: k neighbour slots can cover at
+        # most this fraction of the tie group.
         "mean_frac_of_tie_group_reachable_at_k10": float(
             np.mean(np.minimum(1.0, DISAGREEMENT_K / (per_ep - 1)))
         ),
@@ -368,12 +332,9 @@ def tie_group_sizes(task_index: np.ndarray) -> dict:
 def cca_weights(a: np.ndarray, b: np.ndarray, k: int, reg: float):
     """Canonical directions, by the same construction ``cca_alignment`` uses.
 
-    ``cca_alignment`` returns correlations only, so cross-validation -- fit the
-    directions on one half, *apply* them to the other -- needs the weights. This
-    duplicates the module's whitening-plus-SVD path rather than reimplementing
-    CCA differently, and ``cross_validated_cca`` asserts that the in-sample
-    correlations it produces reproduce ``cca_alignment``'s to 1e-8. If that
-    assertion ever fires, this function is wrong, not the module.
+    ``cca_alignment`` returns only correlations, and cross-validation needs the
+    weights to apply to the held-out half. ``cross_validated_cca`` records the
+    largest difference between these singular values and the module's.
     """
     n = a.shape[0]
     mu_a, mu_b = a.mean(0), b.mean(0)
@@ -394,10 +355,9 @@ def cca_weights(a: np.ndarray, b: np.ndarray, k: int, reg: float):
 def cross_validated_cca(a: np.ndarray, b: np.ndarray, *, n_splits: int, k: int, reg: float) -> dict:
     """In-sample vs held-out canonical correlations over random half-splits.
 
-    At 1,693 episodes against 384-1024 dimensions, in-sample canonical
-    correlations are close to 1 by construction and mean nothing: any two random
-    matrices of this shape align perfectly. The held-out number is the only one
-    that is evidence, and the gap between them is the size of the illusion.
+    With 1,693 episodes against 384-1024 dimensions, in-sample canonical
+    correlations are close to 1 even for random matrices. Only the held-out
+    correlations are evidence; the gap measures the overfitting.
     """
     n = a.shape[0]
     in_s, in_v, out_s = [], [], []
@@ -411,17 +371,15 @@ def cross_validated_cca(a: np.ndarray, b: np.ndarray, *, n_splits: int, k: int, 
         max_gap = max(max_gap, float(np.abs(ref - np.clip(s, 0, 1)).max()))
         za, zb = (a[te] - mu_a) @ wa, (b[te] - mu_b) @ wb
         held = [float(sps.pearsonr(za[:, j], zb[:, j]).statistic) for j in range(k)]
-        # The ridge means the module's singular values are *not* the realised
-        # in-sample correlations of the variates -- they are shrunk. Reporting
-        # both keeps the overfitting gap from being an artefact of that shrinkage.
+        # The ridge shrinks the singular values below the realised in-sample
+        # correlations of the variates, so both are reported.
         ta, tb = (a[tr] - mu_a) @ wa, (b[tr] - mu_b) @ wb
         in_v.append(np.array([sps.pearsonr(ta[:, j], tb[:, j]).statistic for j in range(k)]))
         in_s.append(np.clip(s, 0, 1))
         out_s.append(np.array(held))
     in_s, in_v, out_s = np.stack(in_s), np.stack(in_v), np.stack(out_s)
-    # Held-out correlations can come out negative (a sign flip of a canonical
-    # direction is not identified out of sample); MI depends on rho^2, so it is
-    # computed on |rho|.
+    # Held-out correlations can be negative (the sign of a canonical direction
+    # is not identified out of sample). MI depends on rho^2, so use |rho|.
     mi = [gaussian_mi_from_cca(np.abs(r)) for r in out_s]
     return {
         "n_splits": n_splits,
@@ -453,18 +411,15 @@ def rank_desc(scores: np.ndarray) -> np.ndarray:
 def disagreement_from_nn(nn: np.ndarray, language: np.ndarray) -> np.ndarray:
     """``neighborhood_disagreement`` with the neighbour graph supplied.
 
-    The graph depends only on the visual view, which never changes across the
-    hundreds of label-swap replicates; recomputing it inside every call would
-    dominate the runtime for no reason. ``analyze`` asserts this reproduces
+    The graph depends only on the visual view, so it is computed once and reused
+    across the label-swap replicates. ``analyze`` checks this against
     ``neighborhood_disagreement`` to 1e-12 on the unmodified corpus.
 
-    Scores are snapped at 1e-12. On LIBERO most episodes have ten neighbours
-    carrying a *bit-identical* instruction vector, for which the true score is
-    exactly zero; floating point leaves +/-4e-16 instead. Unsnapped, that noise
-    silently orders the ~1,600 episodes the detector has no opinion about, and it
-    does so in a way that is correlated across encoders (same 40 vectors, similar
-    neighbourhoods) -- which fakes a top-200 encoder agreement of 0.80 where the
-    tie-broken truth is 0.17. Snapping makes the ties visible as ties.
+    Scores are rounded to 12 decimals. Most LIBERO episodes have ten neighbours
+    with a bit-identical instruction vector, so the true score is zero but
+    floating point leaves +/-4e-16. That noise orders the ~1,600 tied episodes
+    in a way that is correlated across encoders, and it produced a top-200
+    encoder agreement of 0.80 where the tie-broken value is 0.17.
     """
     lab = normalize(language)
     raw = 1.0 - np.einsum("nd,nkd->nk", lab, lab[nn]).mean(axis=1)
@@ -472,17 +427,14 @@ def disagreement_from_nn(nn: np.ndarray, language: np.ndarray) -> np.ndarray:
 
 
 def ensemble_scores(per_encoder: dict[str, np.ndarray]) -> tuple[np.ndarray, dict]:
-    """Gate A's ensemble: average the within-encoder ranks, not the score values.
+    """Ensemble the encoders by averaging within-encoder ranks.
 
-    Approved at Gate A for a measured reason: DINOv2 and CLIP agree on the bulk
-    ordering but their top-200 worklists overlap only about half, so an
-    intersection of top-K sets would discard most of what each encoder found,
-    while averaging raw scores would be meaningless across encoders whose score
-    distributions have different spreads. Rank-averaging keeps both encoders'
-    evidence on a common scale.
+    DINOv2 and CLIP top-200 lists overlap only about half, so intersecting them
+    would drop most of what each found, and their raw scores have different
+    spreads, so those cannot be averaged directly.
 
-    Returns ``(suspicion, ranks)`` where higher ``suspicion`` = more suspect, so
-    it can be fed to an AUC directly; ``suspicion`` is the negated mean rank.
+    Returns ``(suspicion, ranks)``. ``suspicion`` is the negated mean rank, so
+    higher means more suspect.
     """
     ranks = {k: rank_desc(v) for k, v in per_encoder.items()}
     mean_rank = np.mean(np.stack(list(ranks.values())), axis=0)
@@ -492,10 +444,9 @@ def ensemble_scores(per_encoder: dict[str, np.ndarray]) -> tuple[np.ndarray, dic
 def top_k_order(suspicion: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     """Episode indices most-suspect first, ties broken at random.
 
-    With 40 distinct instruction vectors the disagreement score takes far fewer
-    distinct values than there are episodes, so ties are common. Breaking them by
-    array order would let precision@50 depend on episode numbering; breaking them
-    randomly makes the tie contribution unbiased and visible in the seed spread.
+    With 40 distinct instruction vectors the score has few distinct values, so
+    ties are common. Breaking them by array order would make precision@50 depend
+    on episode numbering.
     """
     return np.lexsort((rng.random(suspicion.shape[0]), -suspicion))
 
@@ -505,14 +456,12 @@ def swap_instructions(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Permute instructions among a random subset, never onto the same task.
 
-    The permutation is *within* the selected subset, so the corpus-wide
-    distribution of instructions is unchanged -- only the pairing moves. A
-    detector cannot win by noticing that some instruction became more frequent.
+    The permutation is within the selected subset, so the corpus-wide
+    instruction frequencies are unchanged and only the pairing moves.
 
-    Fixed points (an episode drawn back onto its own task) are repaired by
-    swapping with a partner for which both resulting assignments are still
-    task-changing, which terminates as long as the subset spans more than one
-    task; the loop raises rather than looping forever if it does not.
+    Fixed points (an episode mapped back onto its own task) are repaired by
+    swapping with a partner such that both end up on a different task. Raises
+    if the subset spans only one task.
     """
     n = task_index.shape[0]
     sel = rng.choice(n, size=n_swap, replace=False)
@@ -541,7 +490,7 @@ def swap_instructions(
 def detection_metrics(
     suspicion: np.ndarray, truth: np.ndarray, n_swap: int, rng: np.random.Generator
 ) -> dict:
-    """ROC AUC plus precision/recall at the two worklist sizes a human would use."""
+    """ROC AUC plus precision and recall at worklist sizes 50 and 200."""
     from sklearn.metrics import roc_auc_score
 
     order = top_k_order(suspicion, rng)
@@ -567,9 +516,7 @@ def score_distribution(x: np.ndarray) -> dict:
     }
 
 
-# --------------------------------------------------------------------------
-# analysis driver
-# --------------------------------------------------------------------------
+# Analysis driver
 
 
 def analyze() -> None:
@@ -596,7 +543,7 @@ def analyze() -> None:
         }
     }
 
-    # --- 1. spectral diagnostics -------------------------------------------
+    # 1. Spectral diagnostics
     spectral = {}
     for name, v in blocks.items():
         spectral[f"visual_{name}"] = {"dims": int(v.shape[1]), "effective_rank": effective_rank(v)}
@@ -617,7 +564,7 @@ def analyze() -> None:
         k: instruction_space_report(task_lang[k], tasks) for k in LANGUAGE_ENCODERS
     }
 
-    # --- 2. headline: visual-neighbourhood task purity ----------------------
+    # 2. Visual-neighbourhood task purity
     chance = chance_purity(ep_task)
     purity = {"chance_baseline": chance, "by_view": {}}
     for name, v in blocks.items():
@@ -625,15 +572,14 @@ def analyze() -> None:
         for k in cur:
             cur[k]["ratio_to_chance"] = cur[k]["mean_purity"] / chance
         purity["by_view"][name] = cur
-    # The action view is not part of the headline claim, but it is the obvious
-    # "is this just vision?" control and costs nothing.
+    # Action view as a control.
     cur = purity_curve(action, ep_task, PURITY_KS)
     for k in cur:
         cur[k]["ratio_to_chance"] = cur[k]["mean_purity"] / chance
     purity["by_view"]["action (control)"] = cur
     res["task_purity"] = purity
 
-    # --- 3. degenerate-by-design language overlap ---------------------------
+    # 3. Language overlap (degenerate on LIBERO, reported anyway)
     overlap = {}
     for enc in VISUAL_ENCODERS:
         for lk in LANGUAGE_ENCODERS:
@@ -650,7 +596,7 @@ def analyze() -> None:
     res["neighborhood_overlap"] = overlap
     res["language_tie_groups"] = tie_group_sizes(ep_task)
 
-    # --- 4. rank correlation across views ------------------------------------
+    # 4. Rank correlation across views
     rc = {}
     for enc in VISUAL_ENCODERS:
         v = blocks[f"{enc}/{PRIMARY_VISUAL_BLOCK}"]
@@ -665,8 +611,7 @@ def analyze() -> None:
     rc["dinov2 vs clip (both concat)"] = rank_correlation_across_views(
         blocks["dinov2/concat"], blocks["clip/concat"], sample=N_EPISODES, seed=0
     )
-    # How many distinct values the language side of those correlations can take:
-    # pairwise distances between 40 vectors, so at most C(40,2)+1.
+    # The language side has at most C(40,2)+1 distinct pairwise distances.
     n_tasks = len(tasks)
     rc_note = {
         "distinct_language_pair_distances_max": n_tasks * (n_tasks - 1) // 2 + 1,
@@ -674,7 +619,7 @@ def analyze() -> None:
     }
     res["rank_correlation"] = {"values": rc, "language_tie_note": rc_note}
 
-    # --- 5. cross-validated CCA ---------------------------------------------
+    # 5. Cross-validated CCA
     cca = {}
     for enc in VISUAL_ENCODERS:
         v = blocks[f"{enc}/{PRIMARY_VISUAL_BLOCK}"]
@@ -693,7 +638,7 @@ def analyze() -> None:
         "by_pair": cca,
     }
 
-    # --- 6. suspect list -----------------------------------------------------
+    # 6. Suspect list
     nn = {
         enc: knn_indices(blocks[f"{enc}/{PRIMARY_VISUAL_BLOCK}"], DISAGREEMENT_K)
         for enc in VISUAL_ENCODERS
@@ -710,11 +655,9 @@ def analyze() -> None:
     suspicion, ranks = ensemble_scores(scores)
     ens_rank = sps.rankdata(-suspicion, method="ordinal")
 
-    # Ties are pervasive (see specificity_unmodified): the score depends only on
-    # the multiset of neighbour tasks, so hundreds of episodes share a value.
-    # Ordering them by array position would make the published worklist a
-    # function of episode numbering; a seeded random tie-break is reproducible
-    # and unbiased.
+    # The score depends only on the multiset of neighbour tasks, so hundreds of
+    # episodes tie. A seeded random tie-break keeps the worklist from depending
+    # on episode numbering.
     csv_rng = np.random.default_rng(0)
     order = top_k_order(suspicion, csv_rng)[:TOP_N_CSV]
     RESULTS.mkdir(exist_ok=True)
@@ -734,12 +677,9 @@ def analyze() -> None:
     rows.to_csv(SUSPECTS_CSV, index=False)
     print(f"  top-{TOP_N_CSV} suspects written to {SUSPECTS_CSV}")
 
-    # Each encoder gets an *independent* tie-break seed. Sharing one seed would
-    # let the 1,595 episodes tied at score 0 break identically in both encoders
-    # and report a top-200 overlap of 0.8 that is entirely an artefact of the
-    # shared random draw. With independent seeds, tied episodes contribute
-    # chance-level overlap, which is the truth: the encoders have no opinion
-    # about them.
+    # Each encoder gets its own tie-break seed. With a shared seed the 1,595
+    # episodes tied at score 0 break identically in both encoders and the
+    # top-200 overlap comes out at 0.8 from the shared draw alone.
     def top_set(x: np.ndarray, k: int, seed: int) -> set:
         return set(top_k_order(x, np.random.default_rng(seed))[:k].tolist())
 
@@ -752,10 +692,8 @@ def analyze() -> None:
         "top200_overlap": len(top_d(200) & top_c(200)) / 200,
         "dinov2_top200_in_clip_top500": len(top_d(200) & top_c(500)) / 200,
         "clip_top200_in_dinov2_top500": len(top_c(200) & top_d(500)) / 200,
-        # Set overlaps at a fixed K are partly a fact about tie-breaking here,
-        # because only ~60 episodes per encoder have a nonzero score at all. The
-        # agreement between the *nonzero sets* is the same question asked in a
-        # way no tie-break can influence.
+        # Only ~60 episodes per encoder have a nonzero score, so fixed-K overlaps
+        # depend on tie-breaking. The Jaccard of the nonzero sets does not.
         "nonzero_set_jaccard": float(
             len(set(np.flatnonzero(d > 1e-9).tolist()) & set(np.flatnonzero(c > 1e-9).tolist()))
             / max(1, len(set(np.flatnonzero(d > 1e-9).tolist()) | set(np.flatnonzero(c > 1e-9).tolist())))
@@ -788,7 +726,7 @@ def analyze() -> None:
         "tie_break": "seeded random (default_rng(0)); scores are heavily tied, see specificity",
     }
 
-    # --- 8. specificity on the unmodified corpus ------------------------------
+    # 8. Specificity on the unmodified corpus
     rng = np.random.default_rng(0)
     ord_un = top_k_order(suspicion, rng)
     mean_rank = -suspicion
@@ -797,11 +735,8 @@ def analyze() -> None:
         "ensemble_mean_rank_distribution": score_distribution(mean_rank),
         "top50_vs_bulk": {},
     }
-    # A score of exactly zero means every one of the episode's ten visual
-    # neighbours carries an identical instruction vector, i.e. the same task --
-    # nothing for the detector to object to. On a corpus whose labels are correct
-    # by construction that is the expected state for almost every episode, and
-    # counting how many episodes are *not* in it is the specificity measurement.
+    # A score of zero means all ten visual neighbours share the episode's task.
+    # Specificity is the count of episodes with a nonzero score.
     tol = 1e-9
     for k, v in scores.items():
         top = np.sort(v)[::-1][:50]
@@ -834,7 +769,7 @@ def analyze() -> None:
     }
     res["specificity_unmodified"] = spec
 
-    # --- 7. label-swap calibration -------------------------------------------
+    # 7. Label-swap calibration
     swap = {}
     task_vecs = task_lang[PRIMARY_LANGUAGE]
     for n_swap in SWAP_SIZES:
@@ -860,8 +795,7 @@ def analyze() -> None:
         }
         swap[str(n_swap)]["n_swapped"] = n_swap
         swap[str(n_swap)]["swapped_fraction"] = n_swap / N_EPISODES
-        # precision@200 cannot exceed S/200 when S < 200; without this ceiling
-        # printed next to it, 0.42 reads as a failure rather than as the maximum.
+        # precision@K cannot exceed S/K when S < K, so store the ceiling too.
         swap[str(n_swap)]["p_at_50_ceiling"] = min(1.0, n_swap / 50)
         swap[str(n_swap)]["p_at_200_ceiling"] = min(1.0, n_swap / 200)
         print(f"  label-swap S={n_swap}: ensemble AUC {swap[str(n_swap)]['ensemble']['auc']['mean']:.3f}")
@@ -963,9 +897,7 @@ def print_summary(res: dict) -> None:
             )
 
 
-# --------------------------------------------------------------------------
-# contact sheets
-# --------------------------------------------------------------------------
+# Contact sheets
 
 
 def episode_frame_plan(episodes: list[int], views: dict) -> dict[int, list[int]]:
@@ -980,11 +912,9 @@ def episode_frame_plan(episodes: list[int], views: dict) -> dict[int, list[int]]
 def fetch_frames(plan: dict[int, list[int]]) -> dict[int, list[np.ndarray]]:
     """Decode the requested frames, one sequential pass per video file.
 
-    Per-frame keyframe seeking is ~200x more expensive per frame than sequential
-    whole-file decode on this machine (measured, see CLAUDE.md), and the frames
-    wanted here are scattered across whole episodes. So: group the requests by
-    video file, decode each needed file once front to back, and keep the frames
-    that were asked for.
+    Seeking to each frame was measured at ~200x the per-frame cost of decoding
+    a whole file sequentially, so requests are grouped by video file and each
+    file is decoded once.
     """
     import av
 
@@ -1023,7 +953,7 @@ def fetch_frames(plan: dict[int, list[int]]) -> dict[int, list[np.ndarray]]:
 
 
 def render_sheet(path: Path, frames: list[np.ndarray], caption: list[str]) -> None:
-    """3x3 grid of 256x256 frames with a legible multi-line caption band."""
+    """3x3 grid of 256x256 frames under a multi-line caption."""
     from PIL import Image, ImageDraw, ImageFont
 
     g, px = CONTACT_GRID, FRAME_PX
@@ -1038,7 +968,7 @@ def render_sheet(path: Path, frames: list[np.ndarray], caption: list[str]) -> No
         if Path(cand).exists():
             font = ImageFont.truetype(cand, 22)
             break
-    if font is None:  # last resort: readable but small
+    if font is None:
         font = ImageFont.load_default()
 
     lines: list[str] = []
@@ -1069,8 +999,8 @@ def contact_sheets() -> None:
     susp = pd.read_csv(SUSPECTS_CSV)
     top = susp["episode_index"].to_numpy()[:N_CONTACT_SHEETS]
 
-    # Controls are drawn from outside the whole top-200 worklist, not merely
-    # outside the top-50, so a "control" cannot be a near-miss suspect.
+    # Controls come from outside the whole top-200 list, so none is a near-miss
+    # suspect.
     rng = np.random.default_rng(0)
     excluded = set(susp["episode_index"].tolist())
     pool = np.array([i for i in range(N_EPISODES) if i not in excluded])

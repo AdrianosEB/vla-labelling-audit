@@ -127,8 +127,7 @@ def test_bootstrap_memory_does_not_scale_with_episode_count():
 
     The first implementation cached one d x d Gram per episode. At 2,000
     episodes x 128 dims that is already 262 MB; at DROID scale it is 59 GB.
-    This runs a shape where the old approach would allocate visibly more than
-    the data itself, and asserts we stay near the size of the embeddings.
+    This asserts peak memory stays near the size of the embeddings.
     """
     import tracemalloc
 

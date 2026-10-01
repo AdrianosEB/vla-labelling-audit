@@ -1,36 +1,21 @@
 """Turn the cached embedding matrices into searchable indexes.
 
-Every number this project reports so far is an aggregate: one alpha for DROID,
-one per-lab table, one ranked worklist of 200 bad episodes. Aggregates cannot
-answer the question a reviewer actually asks -- *show me the episodes that say
-"put the bowl in the sink"* -- and they cannot answer the question the audit
-needs next, which is whether a LIBERO frame's pixels match the instruction
-attached to it. Both are nearest-neighbour lookups against embeddings that are
-already on disk and cost hours to recompute. This script builds the indexes
-once so `scripts/search.py` can be interactive.
+Builds the FAISS indexes that `scripts/search.py` queries, from embeddings
+already cached on disk. There are two, one per embedding space:
 
-Two indexes, because the project has two modalities that live in incompatible
-spaces and must never be mixed:
+* droid-text: 125,276 MiniLM instruction vectors, 384-d, searched with a
+  MiniLM-embedded query. Each row carries its episode, lab, and the episode's
+  disagreement score.
+* libero-frame: 273,465 CLIP ViT-B/32 image-tower vectors, 512-d. Searchable
+  by text because CLIP's text tower projects into the same space. The cached
+  DINOv2 vectors have no text side and are not indexed.
 
-* **droid-text** -- 125,276 MiniLM instruction vectors, 384-d. Searched with a
-  MiniLM-embedded query. Carries per-row provenance (episode, lab, and that
-  episode's disagreement score) so a hit is immediately actionable.
-* **libero-frame** -- 273,465 CLIP ViT-B/32 *image-tower* vectors, 512-d.
-  Searchable by text only because CLIP's text tower projects into this same
-  space; DINOv2 vectors, also cached, have no text side and are deliberately
-  not indexed here.
+Each gets an exact `IndexFlatIP` and an `IndexIVFFlat`. The audit uses the
+exact index, which takes milliseconds at this scale. `--benchmark` scores IVF
+recall@10 against the exact index as ground truth.
 
-Each gets an exact `IndexFlatIP` and an `IndexIVFFlat` variant. The exact index
-is the one the audit uses -- at this scale brute force is milliseconds and
-removes a whole class of "did ANN recall cause that finding?" objection. IVF is
-built to *measure* what that objection would have been worth: `--benchmark`
-scores IVF recall@10 against the exact index as ground truth. It is evidence
-about approximate search, not a replacement for exact search.
-
-Inner product is the metric everywhere, and every vector is L2-normalised
-before it is added, which makes inner product exactly cosine similarity. The
-cached matrices are stored un-normalised, so this normalisation is load-bearing
-rather than defensive.
+The metric is inner product on L2-normalised vectors, i.e. cosine similarity.
+The cached matrices are stored un-normalised, so they must be normalised here.
 
 Run:
     python scripts/build_index.py --which all
@@ -61,10 +46,8 @@ DROID_EMB = DATA / "embeddings_125276_18b80e0e2eb4.npy"
 LIBERO_EMB = DATA / "libero_emb_clip_image_273465_0e874628fd84.npy"
 LIBERO_MANIFEST = DATA / "libero_index_273465_0e874628fd84.npz"
 
-# ~sqrt(n) cells is the standard IVF starting point: it balances the coarse
-# quantiser scan (nlist distance computations per query) against the posting
-# list scan (n/nlist per probe). Hard-coded rather than computed so a rebuilt
-# index is bit-comparable with the benchmark numbers already published.
+# Roughly sqrt(n) cells, the usual IVF starting point. Hard-coded so a rebuilt
+# index matches the published benchmark numbers.
 DROID_NLIST = 350
 LIBERO_NLIST = 520
 
@@ -72,11 +55,9 @@ LIBERO_NLIST = 520
 def normalise(x: np.ndarray) -> np.ndarray:
     """L2-normalise rows in float32, the only dtype FAISS accepts.
 
-    `crossmodal.normalize` raises on a zero-norm row, which is right for an
-    agreement computation where a directionless vector is meaningless. Here a
-    single bad row should not abort a twenty-minute build, so zero norms are
-    clamped and the row is left at the origin -- it will simply never win a
-    search. The embedding caches contain no such row today; this is insurance.
+    Unlike `crossmodal.normalize`, this does not raise on a zero-norm row. The
+    norm is clamped and the row stays at the origin, where it never wins a
+    search. The current caches contain no such row.
     """
     x = np.ascontiguousarray(x, dtype=np.float32)
     n = np.linalg.norm(x, axis=1, keepdims=True)
@@ -84,12 +65,10 @@ def normalise(x: np.ndarray) -> np.ndarray:
 
 
 def build_pair(vecs: np.ndarray, nlist: int, name: str) -> tuple[dict, float, float]:
-    """Build and persist the exact and IVF indexes for one embedding matrix.
+    """Build and save the exact and IVF indexes for one embedding matrix.
 
-    Returns the on-disk sizes plus both build times, because the honest
-    comparison of exact against IVF has to price in the training pass: IVF
-    wins on query latency and loses on build, and a table that reports only
-    the first is an advertisement rather than a measurement.
+    Returns the on-disk sizes and both build times. The IVF time includes
+    training.
     """
     flat_path = INDEX_DIR / f"{name}_flat.faiss"
     ivf_path = INDEX_DIR / f"{name}_ivf.faiss"
@@ -101,9 +80,8 @@ def build_pair(vecs: np.ndarray, nlist: int, name: str) -> tuple[dict, float, fl
     flat_secs = time.perf_counter() - t0
     faiss.write_index(flat, str(flat_path))
 
-    # The coarse quantiser must use the same metric as the index it serves --
-    # an L2 quantiser over normalised vectors gives a *similar* but not
-    # identical partition, and the mismatch shows up as unexplained recall loss.
+    # The coarse quantiser has to use the same metric as the index. An L2
+    # quantiser partitions slightly differently and costs recall.
     t0 = time.perf_counter()
     quantiser = faiss.IndexFlatIP(dim)
     ivf = faiss.IndexIVFFlat(quantiser, dim, nlist, faiss.METRIC_INNER_PRODUCT)
@@ -124,20 +102,13 @@ def build_pair(vecs: np.ndarray, nlist: int, name: str) -> tuple[dict, float, fl
     return sizes, flat_secs, ivf_secs
 
 
-# --------------------------------------------------------------------------
-# droid-text
-# --------------------------------------------------------------------------
-
-
 def droid_rows() -> tuple[np.ndarray, list[str], np.ndarray]:
-    """Rebuild the exact row order the cached DROID embeddings were written in.
+    """Rebuild the row order the cached DROID embeddings were written in.
 
-    The .npy on disk is a bare matrix with no row labels, so a sidecar built
-    from a *re-derived* ordering would be silently misaligned -- every hit
-    would name the wrong episode and nothing would look broken. Reusing
-    `droid_agreement.flatten`, the same function that produced the order, is
-    the only way to be sure; the row-count assertion below turns any future
-    drift in that function into a loud failure instead of a quiet one.
+    The .npy has no row labels, so the metadata has to come from
+    `droid_agreement.flatten`, the function that produced the order. A
+    different ordering would attach the wrong episode to every hit without any
+    error. The row-count check catches a stale cache.
     """
     episodes, texts, _ = flatten(fetch_annotations())
     emb = np.load(DROID_EMB)
@@ -154,14 +125,10 @@ def build_droid() -> dict:
     episodes, texts, emb = droid_rows()
     print(f"  {emb.shape[0]:,} x {emb.shape[1]} vectors, {len(set(episodes.tolist())):,} episodes")
 
-    # Recomputed rather than read from droid_agreement_results.json, which
-    # stores only the worst 200. It is the same function on the same vectors,
-    # so the 200 overlapping values are identical -- this just covers the other
-    # ~37k multiply-annotated episodes too.
+    # Recomputed because droid_agreement_results.json stores only the worst 200
+    # episodes and all ~37k multiply-annotated ones are needed here.
     scores = per_unit_disagreement(episodes, emb)
-    # Singly-annotated episodes have no within-episode disagreement to measure
-    # (per_unit_disagreement skips groups of size < 2); NaN records "not
-    # computable" rather than pretending the episode scored a perfect zero.
+    # Singly-annotated episodes have no score, so they get NaN, not zero.
     agreement = np.array([scores.get(e, np.nan) for e in episodes], dtype=np.float64)
     n_scored = int(np.isfinite(agreement).sum())
     print(f"  agreement score on {n_scored:,}/{len(agreement):,} rows ({len(scores):,} episodes)")
@@ -189,11 +156,6 @@ def build_droid() -> dict:
     }
 
 
-# --------------------------------------------------------------------------
-# libero-frame
-# --------------------------------------------------------------------------
-
-
 def build_libero() -> dict:
     print("[libero-frame] CLIP ViT-B/32 image-tower vectors")
     man = np.load(LIBERO_MANIFEST, allow_pickle=True)
@@ -202,10 +164,8 @@ def build_libero() -> dict:
         raise SystemExit("row mismatch between the CLIP matrix and its manifest")
     print(f"  {emb.shape[0]:,} x {emb.shape[1]} vectors, {len(man['episode_length']):,} episodes")
 
-    # The per-row instruction is stored as (task_index -> tasks) rather than
-    # 273,465 resolved strings: there are 40 distinct instructions, so the
-    # lookup table is the same information at 0.01% of the size, and it keeps
-    # the sidecar's task ids agreeing with the manifest by construction.
+    # Store task_index plus the 40-entry tasks table instead of 273,465
+    # instruction strings.
     np.savez_compressed(
         INDEX_DIR / "libero_frame_meta.npz",
         episode_index=man["episode_index"],
@@ -229,24 +189,14 @@ def build_libero() -> dict:
     }
 
 
-# --------------------------------------------------------------------------
-# benchmark
-# --------------------------------------------------------------------------
-
-
 def bench_one(name: str, nprobes: list[int], n_queries: int, k: int, seed: int) -> dict:
     """Recall and latency for one index family, exact vs IVF at each nprobe.
 
-    Queries are drawn from the indexed vectors themselves. That makes rank 1 a
-    guaranteed self-match and so slightly flatters both indexes -- but it
-    flatters them *equally*, and recall here is measured IVF-against-exact, not
-    against absolute truth, so the shared bias cancels. The alternative
-    (holding out real vectors) would cost a rebuild of both indexes for a
-    comparison that answers the same question.
+    Queries are drawn from the indexed vectors, so rank 1 is always a
+    self-match. That helps both indexes equally, and recall is measured as IVF
+    against exact, so it does not bias the comparison.
 
-    Latency is single-query and single-threaded on purpose. Batched multi-core
-    throughput is the number a serving system cares about; the number *this*
-    project cares about is how long a human waits after typing one query.
+    Latency is single-query and single-threaded, to match interactive use.
     """
     flat = faiss.read_index(str(INDEX_DIR / f"{name}_flat.faiss"))
     ivf = faiss.read_index(str(INDEX_DIR / f"{name}_ivf.faiss"))
@@ -273,8 +223,8 @@ def bench_one(name: str, nprobes: list[int], n_queries: int, k: int, seed: int) 
     for np_ in nprobes:
         ivf.nprobe = np_
         _, got = ivf.search(queries, k)
-        # Set overlap per query, not positional agreement: a permutation within
-        # the top-k is not a recall failure, and IVF ties can reorder freely.
+        # Recall is set overlap per query. Order within the top-k is ignored
+        # because IVF can reorder ties.
         hits = sum(len(set(t.tolist()) & set(g.tolist())) for t, g in zip(truth, got))
         recall = hits / (n_queries * k)
         med, p95 = latency(ivf)
@@ -302,7 +252,7 @@ def run_benchmark(which: str, nprobes: list[int], n_queries: int, k: int, seed: 
 
     missing = [n for n, _ in names if not (INDEX_DIR / f"{n}_flat.faiss").exists()]
     if missing:
-        raise SystemExit(f"no index for {', '.join(missing)} -- run --which all first")
+        raise SystemExit(f"no index for {', '.join(missing)}; run --which all first")
 
     manifest_path = INDEX_DIR / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}

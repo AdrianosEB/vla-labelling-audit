@@ -1,22 +1,13 @@
-"""Do independent annotators describe the same robot episode the same way?
+"""Inter-annotator agreement for free-text robot instructions.
 
-DROID ships up to three independently crowdsourced language instructions for
-95% of its successful episodes -- roughly 75,000 episodes with triple
-annotation -- and publishes no inter-annotator agreement number of any kind.
-This module computes that number.
+DROID has up to three crowdsourced instructions per episode but publishes no
+agreement number. Standard agreement statistics assume categorical labels, and
+these are free text: "pick up the red mug" and "grab the mug" agree, but an
+exact-match statistic scores them as different.
 
-The methodological problem, and the reason this isn't a one-liner: standard
-agreement statistics assume labels are categorical or ordinal. These labels are
-free text. "pick up the red mug", "grab the mug", and "move the arm left" are
-not three categories -- the first two agree and the third does not, and no
-categorical statistic can see that.
-
-Krippendorff's alpha is the right instrument because it is defined over an
-arbitrary difference function rather than over a fixed label type. Supply a
-semantic distance -- cosine distance between sentence embeddings -- and alpha
-becomes a measure of whether annotators described the same *behaviour*, not
-whether they typed the same *string*. That substitution is the small
-methodological contribution here; everything else is textbook.
+Krippendorff's alpha takes an arbitrary difference function, so using squared
+cosine distance between sentence embeddings gives an alpha over meaning
+instead of over strings.
 """
 
 from __future__ import annotations
@@ -39,14 +30,11 @@ __all__ = [
 
 @dataclass(frozen=True)
 class AgreementResult:
-    """Alpha with the two disagreement terms it is built from.
+    """Alpha plus the observed and expected disagreement it is built from.
 
-    Reporting ``observed`` and ``expected`` separately matters: an alpha near
-    zero can mean either "annotators disagree wildly" (observed high) or "every
-    episode gets the same generic label so there is nothing to agree about"
-    (expected low). Those are opposite pathologies and alpha alone conflates
-    them. In robot datasets where a handful of instruction templates cover most
-    episodes, the second is the live risk.
+    The two terms are kept because a low alpha can come from high observed
+    disagreement or from low expected disagreement (every episode gets the same
+    generic label). Alpha alone does not tell these apart.
     """
 
     alpha: float
@@ -63,11 +51,10 @@ class AgreementResult:
 
 
 def cosine_distance_matrix(embeddings: np.ndarray) -> np.ndarray:
-    """Squared cosine distance between every pair of annotation embeddings.
+    """Squared cosine distance between every pair of embeddings.
 
-    Squared, because Krippendorff's alpha is defined over a squared difference
-    function -- using raw cosine distance silently changes the statistic's
-    scale and makes published alphas incomparable.
+    Squared because Krippendorff's alpha is defined over a squared difference
+    function.
     """
     x = np.asarray(embeddings, dtype=float)
     if x.ndim != 2:
@@ -81,12 +68,7 @@ def cosine_distance_matrix(embeddings: np.ndarray) -> np.ndarray:
 
 
 def exact_match_distance_matrix(labels: Sequence) -> np.ndarray:
-    """Nominal difference: 0 if the strings match exactly, 1 otherwise.
-
-    Included so the semantic and string-identity views can be reported side by
-    side. The gap between them is itself a finding -- it is the fraction of
-    apparent disagreement that is only paraphrase.
-    """
+    """Nominal difference: 0 if the strings match exactly, 1 otherwise."""
     arr = np.asarray(labels, dtype=object)
     return (arr[:, None] != arr[None, :]).astype(float)
 
@@ -95,23 +77,17 @@ def krippendorff_alpha(
     unit_ids: Sequence,
     distance_matrix: np.ndarray,
 ) -> AgreementResult:
-    """Krippendorff's alpha over an arbitrary precomputed difference function.
+    """Krippendorff's alpha over a precomputed difference matrix.
 
     Args:
         unit_ids: length-N labels saying which episode each annotation belongs
-            to. Units with a single annotation are dropped automatically --
-            they carry no agreement information.
+            to. Units with a single annotation are dropped.
         distance_matrix: ``[N, N]`` symmetric, zero-diagonal squared
-            differences between annotations, e.g. from
-            :func:`cosine_distance_matrix`.
+            differences, e.g. from :func:`cosine_distance_matrix`.
 
     Returns:
-        Alpha, plus the observed and expected disagreement it came from.
-
-    Interpretation: 1.0 is perfect agreement, 0.0 is what you would expect if
-    annotations were assigned at random, and negative values mean annotators
-    disagree *more* than chance -- usually a sign of a broken annotation
-    interface rather than of genuine ambiguity.
+        Alpha with its observed and expected disagreement. 1.0 is perfect
+        agreement, 0.0 is chance, and negative means worse than chance.
     """
     unit_ids = np.asarray(unit_ids)
     d = np.asarray(distance_matrix, dtype=float)
@@ -153,10 +129,6 @@ def fleiss_kappa(table: np.ndarray) -> float:
     Args:
         table: ``[n_units, n_categories]`` counts of how many annotators
             assigned each category to each unit.
-
-    Reported alongside alpha when instructions have been bucketed into verb or
-    object categories. If kappa and the semantic alpha diverge sharply, the
-    bucketing is doing the work rather than the annotators.
     """
     t = np.asarray(table, dtype=float)
     if t.ndim != 2:
@@ -185,10 +157,6 @@ def bootstrap_alpha_ci(
 ) -> tuple[float, float, float]:
     """Percentile CI for alpha, resampling whole units.
 
-    Resampling units rather than individual annotations is the only correct
-    choice -- annotations within a unit are the thing being compared, so
-    breaking them apart destroys the quantity being estimated.
-
     Returns:
         ``(alpha, low, high)``.
     """
@@ -215,12 +183,7 @@ def bootstrap_alpha_ci(
 
 
 def per_unit_disagreement(unit_ids: Sequence, distance_matrix: np.ndarray) -> dict:
-    """Mean pairwise difference within each unit, for ranking suspect episodes.
-
-    The corpus-level alpha is the headline. This is the operational output: the
-    episodes whose annotators disagreed most are the ones worth looking at, and
-    they are also the natural seed set for a manual validation pass.
-    """
+    """Mean pairwise difference within each unit, for ranking suspect episodes."""
     unit_ids = np.asarray(unit_ids)
     d = np.asarray(distance_matrix, dtype=float)
     out: dict = {}

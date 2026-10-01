@@ -1,28 +1,18 @@
-"""Turn "the labels are noisy" into "the labels cost you N points".
+"""Controlled label-noise injection and the degradation curve fitted from it.
 
-Measuring label noise is descriptive. The claim worth making is causal: given a
-measured noise rate, how much policy performance does it destroy?
+There is no clean version of DROID to compare against, so the cost of label
+noise is estimated the other way round: inject known amounts of noise, train
+at each level, and fit performance against noise rate.
 
-Since nobody can run the counterfactual on a real dataset -- there is no clean
-version of DROID to compare against -- the move is to go the other way. Take a
-dataset, inject *known* amounts of label noise, train at each level, and fit the
-degradation curve. That curve converts a measured noise rate into a predicted
-performance cost, which is the sentence the paper exists to write.
+Noise modes:
 
-Three noise modes, because they are not equivalent and the literature routinely
-conflates them:
-
-* ``swap``     - the label of episode A is attached to episode B. Realistic for
-                 pipeline/indexing bugs. Preserves the label distribution
-                 exactly, so a model can still learn the marginal.
-* ``shuffle``  - labels permuted across the whole corpus. The pure "language
-                 carries no information" condition, and the right *upper bound*
-                 on damage.
-* ``paraphrase`` - the label is replaced by a semantically close one. Models
-                 crowdsourced annotators describing the same thing differently.
-                 Should be nearly harmless if the encoder is any good, which
-                 makes it the control that separates real label noise from
-                 mere lexical variation.
+* ``swap``       - the labels of two episodes are exchanged. Models indexing
+                   bugs. Preserves the label distribution exactly.
+* ``shuffle``    - labels are permuted among the corrupted episodes. An upper
+                   bound on damage.
+* ``paraphrase`` - the label is replaced by its nearest neighbour in embedding
+                   space. Models annotators wording the same thing differently,
+                   and serves as the control.
 """
 
 from __future__ import annotations
@@ -45,12 +35,10 @@ class NoiseResult:
 
     @property
     def realised_rate(self) -> float:
-        """Fraction actually changed, which is not always the requested rate.
+        """Fraction of labels actually changed.
 
-        Under ``swap`` a pair can be drawn that already shares a label, and
-        under ``paraphrase`` the nearest alternative may be the label itself.
-        Report this rather than the nominal rate; the gap is small but it is the
-        kind of thing that quietly biases a fitted curve.
+        Can be lower than the requested rate: a swap may pair two episodes that
+        already share a label, and the nearest paraphrase may be the same label.
         """
         return len(self.corrupted_idx) / len(self.labels)
 
@@ -63,14 +51,14 @@ def inject_label_noise(
     embeddings: np.ndarray | None = None,
     seed: int = 0,
 ) -> NoiseResult:
-    """Corrupt a known fraction of labels in a controlled, reproducible way.
+    """Corrupt a given fraction of labels reproducibly.
 
     Args:
         labels: ``[N]`` label ids or strings.
         rate: fraction of episodes to corrupt, in ``[0, 1]``.
         mode: ``"swap"``, ``"shuffle"``, or ``"paraphrase"``.
         embeddings: ``[N, d]`` label embeddings, required for ``"paraphrase"``.
-        seed: reproducibility.
+        seed: RNG seed.
     """
     lab = np.asarray(labels).copy()
     n = lab.shape[0]
@@ -111,12 +99,11 @@ def inject_label_noise(
 def fit_degradation_curve(rates: np.ndarray, scores: np.ndarray) -> dict:
     """Least-squares line through (noise rate, performance).
 
-    Deliberately linear. With five or six noise levels and real seed variance,
-    a richer functional form fits noise rather than signal, and the slope --
-    "each point of label noise costs S points of success" -- is the quantity the
-    paper needs anyway.
+    Linear on purpose: with five or six noise levels a richer form would fit
+    seed variance.
 
-    Returns slope, intercept, r, and the two-sided p-value for the slope.
+    Returns slope, intercept, r, the two-sided p-value for the slope, and its
+    standard error.
     """
     r = np.asarray(rates, dtype=float).ravel()
     s = np.asarray(scores, dtype=float).ravel()
@@ -137,13 +124,10 @@ def fit_degradation_curve(rates: np.ndarray, scores: np.ndarray) -> dict:
 
 
 def predicted_cost(curve: dict, measured_noise_rate: float) -> float:
-    """Performance cost implied by a measured real-world noise rate.
+    """Performance cost implied by a measured noise rate, from the fitted slope.
 
-    The final step of the argument: the audit measures how much noise exists,
-    the injection experiment measures what noise costs, and this multiplies
-    them. State the extrapolation assumption out loud when reporting it --
-    injected noise is uniform and synthetic, real noise is neither, so this is
-    an estimate of the right order of magnitude, not a point prediction.
+    This extrapolates from uniform synthetic noise to real noise, so treat it
+    as an order-of-magnitude estimate.
     """
     if not 0.0 <= measured_noise_rate <= 1.0:
         raise ValueError("measured_noise_rate must lie in [0, 1]")

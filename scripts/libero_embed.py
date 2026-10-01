@@ -1,41 +1,31 @@
 """Turn LIBERO's 546,930 AV1-encoded frames into cached image embeddings, once.
 
-Session 2 needs a joint vector index over LIBERO images and their language
-labels in order to ask whether an instruction actually describes the trajectory
-it is attached to. Everything downstream of that -- nearest neighbours,
-per-episode mismatch scores, the ranked worklist -- reads embeddings, never
-pixels. So the pixels get read exactly once, here, and the vectors go to disk.
+Everything downstream reads embeddings, so the video is decoded once here and
+the vectors are written to disk.
 
-Three facts about this machine shape the whole design:
+Constraints on the machine this was developed on (M2 Pro, 16 GB):
 
-* **M2 has no AV1 hardware decode** (Apple added it in M3). Decoding is
-  software, via libdav1d in PyAV. Decoding the corpus twice is a waste measured
-  in tens of minutes, so this script is resumable at video-file granularity and
-  writes straight into a memmap: a crash costs one file, not the run.
-* **Sequential decode is ~200x cheaper per frame than seeking.** Measured on
-  this dataset: a full-file linear decode runs at ~2,300-2,500 img/s, while
-  seeking to a keyframe per frame collapses to low tens. Each mp4 concatenates
-  ~10k frames from ~35 episodes back to back, so the loop below opens each file
-  once, decodes every frame in presentation order, and maps decode position to
-  dataset row using the episodes-meta ``from_timestamp`` ranges. Seeking is used
-  only in ``--verify``, where it is the *independent* implementation whose job is
-  to disagree if the fast path drifted.
-* **16 GB of unified memory is shared with the GPU** and
-  ``is_amp_available("mps")`` is False, so this is fp32 with a modest batch.
+* No AV1 hardware decode, so decoding is software (libdav1d via PyAV). The run
+  is resumable per video file and writes into a memmap, so a crash costs one
+  file.
+* Sequential decode is ~200x cheaper per frame than seeking: ~2,300-2,500 img/s
+  for a full-file linear decode against low tens when seeking per frame. Each
+  mp4 holds ~10k frames from ~35 episodes back to back, so each file is opened
+  once, decoded in presentation order, and mapped to dataset rows using the
+  ``from_timestamp`` ranges in the episodes metadata. Seeking is only used by
+  ``--verify``, as an independent check on that mapping.
+* Memory is shared with the GPU and ``is_amp_available("mps")`` is False, so
+  this runs fp32 with a modest batch.
 
-Two encoders, deliberately chosen to fail differently:
+Two encoders with opposite training recipes:
 
-* ``dinov2`` -- facebook/dinov2-small, 384-d. Self-supervised, vision-only. The
-  primary instrument: it has never seen a caption, so it cannot inherit a
-  language prior from the same distribution the labels came from.
-* ``clip`` -- openai/clip-vit-base-patch32 image tower, 512-d. Language-
-  supervised, i.e. the opposite training recipe. If both encoders flag the same
-  episodes, the finding is not an artefact of either one's geometry.
+* ``dinov2``: facebook/dinov2-small, 384-d. Self-supervised and vision-only,
+  so it has no language prior. This is the primary encoder.
+* ``clip``: openai/clip-vit-base-patch32 image tower, 512-d. Language-supervised.
 
-Because MPS has a documented class of silent-garbage bugs (lerobot#496), the
-device is never trusted on faith: ``--check-mps`` re-embeds a sample on CPU and
-compares, and refuses to bless the run if cosine similarity drops below
-``MPS_COSINE_FLOOR``.
+MPS has had bugs that return garbage without an error (lerobot#496), so
+``--check-mps`` re-embeds a sample on CPU and fails if cosine similarity drops
+below ``MPS_COSINE_FLOOR``.
 
 Run:
     python scripts/libero_embed.py --check-mps --encoder dinov2
@@ -64,26 +54,20 @@ ROOT = Path(__file__).resolve().parent.parent
 CACHE = ROOT / "data"
 LIBERO = CACHE / "libero"
 
-# facebook/dinov2-small is the ViT-S/14 checkpoint chosen in CLAUDE.md over
-# ViT-B/14: 384-d halves both embed time and index memory, and at 273k rows the
-# exact-search index has to fit alongside the GPU's own allocations.
+# dinov2-small (ViT-S/14, 384-d) instead of ViT-B/14: half the embed time and
+# half the index memory.
 ENCODERS = {
     "dinov2": "facebook/dinov2-small",
     "clip": "openai/clip-vit-base-patch32",
 }
 CAMERAS = ["observation.images.image", "observation.images.image2"]
 
-# 128 is where MPS throughput plateaus for both towers (measured: dinov2 117-123
-# img/s at 64/128/256, clip 205 at 64 and 202 at 128). Bigger batches buy
-# nothing and only raise the peak allocation on memory the GPU shares with the
-# rest of the machine.
+# MPS throughput is flat past this (dinov2 117-123 img/s at 64/128/256, clip
+# 205 at 64 and 202 at 128), so a bigger batch only costs memory.
 BATCH_SIZE = 128
 
-# Decoded frames are handed over in chunks, not whole files. A whole mp4 is
-# ~10k x 256 x 256 x 3 = 2.0 GB of uint8, and with one file in the queue, one
-# being decoded and one being embedded that is ~6 GB of a 16 GB pool the GPU is
-# also drawing on. 512-frame chunks cost 100 MB each, so a 4-deep queue keeps
-# the GPU continuously fed for 0.4 GB.
+# A whole decoded mp4 is ~2.0 GB of uint8 (~10k x 256 x 256 x 3), so frames are
+# passed to the GPU in 512-frame chunks of ~100 MB through a 4-deep queue.
 DECODE_CHUNK = 512
 DECODE_QUEUE_DEPTH = 4
 
@@ -91,21 +75,12 @@ MPS_COSINE_FLOOR = 0.9999
 MPS_CHECK_N = 200
 
 
-# --------------------------------------------------------------------------
-# dataset identity
-# --------------------------------------------------------------------------
-
-
 def dataset_tag() -> str:
-    """A content hash tying every cache file to this exact dataset revision.
+    """Hash identifying this dataset revision, used in every cache filename.
 
-    Hashing 1.94 GB of video on every run would cost more than the embedding
-    does, so the digest covers the metadata that *defines* the layout --
-    info.json, the episodes table, the task table -- plus the size in bytes of
-    every video file. A re-download that changed any frame would change a file
-    size or the episode boundaries; a hash collision would require the new
-    dataset to have byte-identical metadata and byte-identical file lengths, at
-    which point it is the same dataset.
+    Covers info.json, the episodes table, the task table, and the byte size of
+    every video file. Hashing the 1.94 GB of video itself would be too slow to
+    do on every run.
     """
     h = hashlib.sha256()
     for rel in ["meta/info.json", "meta/tasks.parquet", "meta/episodes/chunk-000/file-000.parquet"]:
@@ -119,12 +94,10 @@ def dataset_tag() -> str:
 
 @dataclass(frozen=True)
 class Layout:
-    """Everything needed to place a decoded frame in the output matrix.
+    """Episode metadata needed to place a decoded frame in the output matrix.
 
-    ``row_start`` is the global dataset index of an episode's first frame.
-    Rows are therefore ordered by (episode_index, frame_index) ascending, which
-    is the ordering the analysis pass is promised and the same ordering the
-    per-frame parquet files use.
+    Rows are ordered by (episode_index, frame_index) ascending, the same order
+    the per-frame parquet files use.
     """
 
     episodes: pd.DataFrame
@@ -142,10 +115,8 @@ def load_layout() -> Layout:
 
     starts = ep["dataset_from_index"].to_numpy()
     lengths = ep["length"].to_numpy()
-    # The whole row-assignment scheme rests on this: global row index is the
-    # running total of episode lengths. If the published dataset_from_index ever
-    # disagreed with that, every embedding would land in the wrong row and
-    # nothing downstream would notice.
+    # Row assignment assumes the global row index is the running total of
+    # episode lengths. If that were false, embeddings would land in wrong rows.
     expected = np.concatenate([[0], np.cumsum(lengths)])[:-1]
     if not np.array_equal(starts, expected):
         raise SystemExit("dataset_from_index is not the cumulative sum of episode lengths")
@@ -153,9 +124,8 @@ def load_layout() -> Layout:
         raise SystemExit(f"episode lengths sum to {lengths.sum()}, info.json says {n_rows}")
 
     tasks_df = pd.read_parquet(LIBERO / "meta" / "tasks.parquet")
-    # tasks.parquet is indexed *by the instruction string*, with task_index as
-    # its only column -- the inverse of the obvious layout, so invert it here
-    # rather than in four places downstream.
+    # tasks.parquet is indexed by the instruction string, with task_index as
+    # its only column, so invert it.
     instructions = [""] * len(tasks_df)
     for text, idx in zip(tasks_df.index.astype(str), tasks_df["task_index"].to_numpy()):
         instructions[int(idx)] = text
@@ -171,11 +141,9 @@ def load_layout() -> Layout:
 def episode_task_index(ep: pd.DataFrame) -> np.ndarray:
     """One task_index per episode, read from the per-frame data parquets.
 
-    The episodes table records video offsets but not the task, and the task only
-    lives per frame. LIBERO gives one instruction per episode, so this reads the
-    two index columns from each of the 377 data shards and asserts the episode's
-    task is constant -- an episode with two tasks would mean the label this
-    project is auditing is not even well defined for that trajectory.
+    The episodes table has no task column; the task is only stored per frame.
+    Reads the two index columns from each of the 377 data shards and fails if
+    any episode has more than one task.
     """
     out = np.full(len(ep), -1, dtype=np.int64)
     for path in sorted((LIBERO / "data" / "chunk-000").glob("*.parquet")):
@@ -192,12 +160,10 @@ def episode_task_index(ep: pd.DataFrame) -> np.ndarray:
 def file_plan(layout: Layout, camera: str) -> list[tuple[int, np.ndarray]]:
     """For each video file: the dataset rows its frames map to, in decode order.
 
-    Returned as an explicit row-index array per file rather than a (start, stop)
-    slice. The slice version would be faster and, on this dataset, identical --
-    but it silently assumes the episodes sharing a video file are contiguous in
-    episode_index, and an off-by-one in that assumption is exactly the bug this
-    script is most likely to have. Building the mapping from each episode's own
-    ``dataset_from_index`` cannot drift.
+    Returns an explicit row-index array per file, built from each episode's own
+    ``dataset_from_index``. A (start, stop) slice would give the same result on
+    this dataset but assumes the episodes sharing a file are contiguous in
+    episode_index.
     """
     ep = layout.episodes
     fidx = ep[f"videos/{camera}/file_index"].to_numpy()
@@ -208,9 +174,8 @@ def file_plan(layout: Layout, camera: str) -> list[tuple[int, np.ndarray]]:
     plan = []
     for f in np.unique(fidx):
         sel = np.flatnonzero(fidx == f)
-        # Decode order is presentation order, so episodes must be visited in
-        # from_timestamp order -- not episode_index order, which merely happens
-        # to agree here.
+        # Visit episodes in from_timestamp order, which is the decode order.
+        # episode_index order happens to agree here but is not guaranteed to.
         sel = sel[np.argsort(fts[sel], kind="stable")]
         offsets = np.round(fts[sel] * 10.0).astype(np.int64)
         if not np.array_equal(offsets, np.concatenate([[0], np.cumsum(lengths[sel])])[:-1]):
@@ -220,24 +185,13 @@ def file_plan(layout: Layout, camera: str) -> list[tuple[int, np.ndarray]]:
     return plan
 
 
-# --------------------------------------------------------------------------
-# decode
-# --------------------------------------------------------------------------
-
-
 def decode_file(path: Path, expected: int):
     """Every frame of one mp4, in presentation order, as uint8 NHWC chunks.
 
     Yields ``(offset, images)`` where offset is the frame's position within the
-    file. Presentation timestamps are checked to be strictly increasing and
-    evenly spaced: PyAV yields frames in decode order, which only coincides with
-    presentation order when the stream has no reordering, and silently accepting
-    a reordered stream would scramble frames within an episode.
-
-    The total frame count is checked against the sum of the lengths of the
-    episodes the metadata assigns to this file. A mismatch means the sequential
-    mapping has drifted, and the only safe response is to stop -- a short file
-    would shift every subsequent row by the deficit.
+    file. PyAV yields frames in decode order, so this fails if timestamps are
+    not strictly increasing. It also fails if the frame count differs from
+    ``expected``, since a short file would shift every later row.
     """
     seen = 0
     buf: list[np.ndarray] = []
@@ -262,29 +216,27 @@ def decode_file(path: Path, expected: int):
 def decode_worker(work, out: queue.Queue) -> None:
     """Decode files ahead of the GPU on a background thread.
 
-    PyAV releases the GIL inside libdav1d, so this genuinely overlaps: decode is
-    ~2,400 img/s against ~120 img/s for the ViT forward, which turns four
-    minutes of otherwise-serial decode into zero. An ``("eof", f)`` marker
-    follows each file so the consumer knows when it may record that file as
-    complete; recording it earlier would let a resume skip a half-written file.
+    PyAV releases the GIL inside libdav1d, so decode (~2,400 img/s) overlaps
+    with the ViT forward pass (~120 img/s). An ``("eof", f)`` marker follows
+    each file so the consumer only records a file as complete once all of its
+    chunks have been written.
     """
     try:
         for file_index, path, rows in work:
             for offset, images in decode_file(path, len(rows)):
                 out.put(("chunk", file_index, rows[offset : offset + len(images)], images))
             out.put(("eof", file_index, None, None))
-    except BaseException as exc:  # surfaced on the consumer side, never swallowed
+    except BaseException as exc:  # re-raised by the consumer
         out.put(exc)
     else:
         out.put(None)
 
 
 def seek_frame(path: Path, timestamp: float) -> np.ndarray:
-    """One frame at a wall-clock offset, decoded by seeking -- the slow path.
+    """One frame at a wall-clock offset, decoded by seeking (slow).
 
-    Used only by ``--verify``. It shares no code with the sequential reader on
-    purpose: agreement between the two is evidence, agreement between a function
-    and itself is not.
+    Used only by ``--verify``. Shares no code with the sequential reader so the
+    two can be checked against each other.
     """
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
@@ -296,19 +248,13 @@ def seek_frame(path: Path, timestamp: float) -> np.ndarray:
     raise SystemExit(f"{path.name}: no frame at t={timestamp}")
 
 
-# --------------------------------------------------------------------------
-# embedding
-# --------------------------------------------------------------------------
-
-
 class Embedder:
-    """One encoder pinned to one device, exposing a single uint8-batch call.
+    """One encoder on one device, called with a uint8 image batch.
 
-    Preprocessing runs on CPU even when the model is on MPS. The resize is
-    bicubic, and MPS's bicubic disagrees with the CPU kernel by up to ~0.35 in
-    normalised units on adversarial input -- small, but it would make the
-    MPS-vs-CPU check measure the resampler instead of the model, which is the
-    thing the check exists to interrogate.
+    Preprocessing runs on CPU even when the model is on MPS. MPS's bicubic
+    resize differs from the CPU kernel by up to ~0.35 in normalised units,
+    which would make the MPS-vs-CPU check measure the resampler and not the
+    model.
     """
 
     def __init__(self, key: str, device: str) -> None:
@@ -325,11 +271,9 @@ class Embedder:
     def __call__(self, images: np.ndarray) -> np.ndarray:
         """Embed an NHWC uint8 batch to (N, dim) float32.
 
-        One vector per image: CLIP's projected ``image_embeds`` (what
-        ``get_image_features`` returns) and DINOv2's ``pooler_output``, which is
-        the CLS token after the final layernorm -- the canonical DINOv2 global
-        descriptor. Not L2-normalised here; normalisation is a decision for the
-        index, and a cache that has already been normalised cannot be un-.
+        Uses CLIP's projected ``image_embeds`` and DINOv2's ``pooler_output``
+        (the CLS token after the final layernorm). Vectors are not
+        L2-normalised here; the index does that.
         """
         out = np.empty((len(images), self.dim), dtype=np.float32)
         tensor = torch.from_numpy(images).permute(0, 3, 1, 2).contiguous()
@@ -341,11 +285,6 @@ class Embedder:
                 vec = res.image_embeds if self.key == "clip" else res.pooler_output
                 out[i : i + len(chunk)] = vec.float().cpu().numpy()
         return out
-
-
-# --------------------------------------------------------------------------
-# cache paths
-# --------------------------------------------------------------------------
 
 
 def cam_slug(camera: str) -> str:
@@ -361,11 +300,10 @@ def manifest_path(n_rows: int, tag: str) -> Path:
 
 
 def write_manifest(layout: Layout, tag: str) -> Path:
-    """Per-row episode/frame/task alignment, so no consumer re-derives it.
+    """Write the per-row episode/frame/task index shared by all embedding files.
 
-    Row order here *is* the row order of every embedding matrix. Shipping the
-    instruction strings alongside the indices means the analysis pass never has
-    to reopen the LIBERO metadata, and therefore cannot reopen it differently.
+    Row order matches every embedding matrix. The instruction strings are
+    stored too, so the analysis does not need to reopen the LIBERO metadata.
     """
     path = manifest_path(layout.n_rows, tag)
     if path.exists():
@@ -387,19 +325,12 @@ def write_manifest(layout: Layout, tag: str) -> Path:
     return path
 
 
-# --------------------------------------------------------------------------
-# the pass
-# --------------------------------------------------------------------------
-
-
 def embed_camera(key: str, camera: str, layout: Layout, tag: str, device: str) -> Path:
-    """Embed every frame of one camera, resumable at video-file granularity.
+    """Embed every frame of one camera, resumable per video file.
 
-    Work lands in a ``.part`` memmap with a sibling progress file listing the
-    video files already written. Interrupting the run costs at most one file
-    (~90 seconds of GPU), and rerunning the command picks up where it stopped --
-    which matters because a full pass is over an hour and this machine is also
-    someone's laptop.
+    Writes into a ``.part`` memmap with a progress file listing the video files
+    already done. An interrupted run loses at most one file (~90 s of GPU) and
+    resumes when the command is rerun.
     """
     final = cache_path(key, camera, layout.n_rows, tag)
     if final.exists():
@@ -471,10 +402,8 @@ def embed_camera(key: str, camera: str, layout: Layout, tag: str, device: str) -
                 "dtype": "float32",
                 "batch_size": BATCH_SIZE,
                 "device": device,
-                # Scoped to *this* invocation: a resumed run only embeds the
-                # files a previous run did not, so reporting these as the cost
-                # of the whole camera would understate it. frames_embedded_this_run
-                # is the denominator that makes them interpretable.
+                # Timings cover this invocation only; a resumed run embeds
+                # fewer frames than the whole camera.
                 "wall_seconds_this_run": round(wall, 1),
                 "images_per_second_this_run": round(n_done / wall, 1) if wall else None,
                 "frames_embedded_this_run": n_done,
@@ -492,19 +421,12 @@ def embed_camera(key: str, camera: str, layout: Layout, tag: str, device: str) -
     return final
 
 
-# --------------------------------------------------------------------------
-# the two things that must be checked before the cache is trusted
-# --------------------------------------------------------------------------
-
-
 def check_mps(key: str, layout: Layout) -> None:
-    """Embed the same images on MPS and CPU and refuse to proceed if they differ.
+    """Embed the same images on MPS and CPU and exit if they differ.
 
-    lerobot#496 is the reference case: an MPS transfer that returned garbage
-    with no error. That failure mode is silent, so it has to be tested for
-    rather than waited for. fp32 reassociation between two backends is worth a
-    few 1e-4 absolute; anything that moves cosine below MPS_COSINE_FLOOR is not
-    numerics.
+    See lerobot#496, where an MPS transfer returned garbage with no error.
+    fp32 differences between backends are around 1e-4 absolute, which keeps
+    cosine above MPS_COSINE_FLOOR.
     """
     cam = CAMERAS[0]
     path = LIBERO / "videos" / cam / "chunk-000" / "file-000.mp4"
@@ -533,13 +455,12 @@ def check_mps(key: str, layout: Layout) -> None:
 
 
 def verify_alignment(key: str, layout: Layout, tag: str, n: int, device: str) -> None:
-    """Re-derive a handful of cached rows by the independent seek path.
+    """Recompute a few cached rows via the seek path and compare.
 
-    This is the guard against the one bug that would poison everything without
-    showing up anywhere else: an off-by-one in mapping sequential decode
-    position to dataset row. A shifted cache still has the right shape, the
-    right norms, and plausible neighbours -- it is only wrong. Picks are spread
-    across video files, across episodes, and cover both cameras.
+    Catches an off-by-one in the mapping from decode position to dataset row,
+    which would otherwise go unnoticed because a shifted cache still has the
+    right shape and norms. Picks are spread across video files, episodes, and
+    both cameras.
     """
     rng = np.random.default_rng(0)
     ep = layout.episodes
@@ -548,8 +469,7 @@ def verify_alignment(key: str, layout: Layout, tag: str, n: int, device: str) ->
     picks = []
     for i in range(n):
         cam = CAMERAS[i % len(CAMERAS)]
-        # Spread over the file axis rather than the episode axis so consecutive
-        # picks cannot all land in one mp4.
+        # Spread picks over files so they do not all land in one mp4.
         fidx = ep[f"videos/{cam}/file_index"].to_numpy()
         target_file = sorted(np.unique(fidx))[int(i * (len(np.unique(fidx)) - 1) / max(n - 1, 1))]
         candidates = np.flatnonzero(fidx == target_file)
@@ -578,9 +498,6 @@ def verify_alignment(key: str, layout: Layout, tag: str, n: int, device: str) ->
             f"  {cam_slug(cam):<7} ep {e:>5} frame {f:>4} (mp4 {file_index:>3}, row {row:>7})"
             f"  cosine {cos:.6f}  {flag}"
         )
-
-
-# --------------------------------------------------------------------------
 
 
 def main() -> None:
